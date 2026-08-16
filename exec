@@ -3,11 +3,45 @@
 
 ; ===== CONFIGURATION =====
 global CONFIG := {
+    ; URLs
     baseUrl: "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/",
+    manifestUrl: "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/manifest.json",
+    
+    ; Paths
     dllPath: A_ScriptDir . "\bin\Cloudy.dll",
+    manifestPath: A_ScriptDir . "\bin\manifest.json",
     logFile: A_ScriptDir . "\cloudy.log",
+    
+    ; Limits
     maxLogLines: 200,
-    maxLogSize: 524288  ; 512KB
+    maxLogSize: 524288,  ; 512KB
+    maxDownloadRetries: 3,
+    downloadRetryDelay: 1000,
+    
+    ; DLL call timeouts (ms)
+    dllTimeout: 5000,
+    
+    ; Default script
+    defaultScript: "
+(
+print('hello from cloudy')
+game:GetService('StarterGui'):SetCore(
+  'SendNotification', {
+    Title = 'CLOUDY',
+    Text = 'working!'
+  }
+)
+)",
+    
+    ; UI strings (safe ASCII)
+    topBorder: "============================================================",
+    separator: "------------------------------------------------------------",
+    thinSep: "------------------------------------------------------------",
+    logo: "   _______ __   _ _______ __   _  _____  _    _ _______" . "`n"
+         . "  |_____| |  | | |_____| |  | | |     |  \  /  |_____|" . "`n"
+         . "  |     | |__| | |     | |__| | |_____|   \/   |     |" . "`n"
+         . "          E X E C U T O R   v1.2",
+    footer: "v1.2 // CLOUDY x NYX // [ESC] EXIT"
 }
 
 ; ===== STATE =====
@@ -18,7 +52,9 @@ global STATE := {
     consoleLines: [],
     gui: 0,
     animPhase: 0,
-    robloxPid: 0
+    robloxPids: [],
+    lastLogWriteOk: true,
+    clientRefreshTimer: 0
 }
 
 ; ===== FILE DEFINITIONS =====
@@ -33,35 +69,129 @@ global REQUIRED_FILES := [
     {name: "fmt.dll", dir: "", required: false}
 ]
 
-; ===== UI STRINGS (safe ASCII) =====
-global UI := {
-    topBorder: "============================================================",
-    separator: "------------------------------------------------------------",
-    thinSep: "------------------------------------------------------------",
-    logo: "
-(
-   _______ __   _ _______ __   _  _____  _    _ _______
-  |_____| |  | | |_____| |  | | |     |  \  /  |_____|
-  |     | |__| | |     | |__| | |_____|   \/   |     |
-          E X E C U T O R   v1.1
-)",
-    footer: "v1.1 // CLOUDY x NYX // [ESC] EXIT"
+; ===== SHA256 VERIFICATION =====
+
+class HashVerifier {
+    static GetFileHash(filePath) {
+        if !FileExist(filePath)
+            return ""
+        
+        try {
+            ; Use PowerShell for SHA256 (built into Windows)
+            local cmd := 'powershell -NoProfile -Command "(Get-FileHash -Path ''' . StrReplace(filePath, "'", "''") . ''' -Algorithm SHA256).Hash"'
+            local hash := Trim(RunCmd(cmd))
+            return (hash ? StrLower(hash) : "")
+        } catch {
+            return ""
+        }
+    }
+    
+    static VerifyFile(filePath, expectedHash) {
+        if !expectedHash || !FileExist(filePath)
+            return false
+        
+        local actual := this.GetFileHash(filePath)
+        if !actual
+            return false
+        
+        return (StrLower(actual) = StrLower(expectedHash))
+    }
+    
+    static LoadManifest(manifestPath) {
+        if !FileExist(manifestPath)
+            return Map()
+        
+        try {
+            local content := FileRead(manifestPath, "UTF-8")
+            ; Simple JSON parse for {"filename": "hash"} format
+            local manifest := Map()
+            
+            ; Remove braces and whitespace
+            content := Trim(content)
+            if (SubStr(content, 1, 1) = "{")
+                content := SubStr(content, 2, -1)
+            if (SubStr(content, -1) = "}")
+                content := SubStr(content, 1, -1)
+            
+            ; Parse key-value pairs
+            local pairs := StrSplit(content, ",")
+            for pair in pairs {
+                pair := Trim(pair)
+                if RegExMatch(pair, """([^""]+)""\s*:\s*""([^""]+)""", &m) {
+                    manifest[m[1]] := m[2]
+                }
+            }
+            
+            return manifest
+        } catch {
+            return Map()
+        }
+    }
 }
 
-; ===== AUTO-SETUP (with verification) =====
+; Run command and capture output
+RunCmd(cmd) {
+    local output := ""
+    try {
+        local exec := ComObjCreate("WScript.Shell").Exec("cmd /c " . cmd)
+        while !exec.Status {
+            Sleep(10)
+            output .= exec.StdOut.ReadAll()
+        }
+        output .= exec.StdOut.ReadAll()
+    }
+    return Trim(output)
+}
+
+; ===== SAFE STRING TO BUFFER =====
+
+StringToBuffer(str, encoding := "UTF-8") {
+    local size := StrPut(str, encoding)
+    local buf := Buffer(size)
+    StrPut(str, buf, encoding)
+    return buf
+}
+
+; ===== AUTO-SETUP (with verification + retries) =====
 
 AutoSetup() {
     local needsDownload := false
     local missingRequired := []
+    local manifest := Map()
+    
+    ; Try to download manifest first
+    Log("[SYS] Checking for manifest...")
+    local manifestOk := this.DownloadWithRetry(CONFIG.manifestUrl, CONFIG.manifestPath, false)
+    
+    if manifestOk && FileExist(CONFIG.manifestPath) {
+        manifest := HashVerifier.LoadManifest(CONFIG.manifestPath)
+        if manifest.Count > 0
+            Log("[SYS] Manifest loaded (" . manifest.Count . " entries)")
+        else
+            Log("[WRN] Manifest parse failed - skipping hash verify")
+    } else {
+        Log("[WRN] No manifest - size-only verification")
+    }
     
     ; Check what's missing
     for f in REQUIRED_FILES {
-        path := BuildFilePath(f)
+        local path := BuildFilePath(f)
+        local needsUpdate := false
+        
         if !FileExist(path) {
             needsDownload := true
-            if f.required
-                missingRequired.Push(f.name)
+            needsUpdate := true
+        } else if (manifest.Has(f.name)) {
+            ; Verify existing file hash
+            if !HashVerifier.VerifyFile(path, manifest[f.name]) {
+                Log("[WRN] " . f.name . " hash mismatch - redownloading")
+                needsDownload := true
+                needsUpdate := true
+            }
         }
+        
+        if needsUpdate && f.required
+            missingRequired.Push(f.name)
     }
     
     if !needsDownload {
@@ -79,67 +209,115 @@ AutoSetup() {
     local success := 0
     local failed := 0
     local failedNames := []
+    local failedRequired := []
     
     for f in REQUIRED_FILES {
         local path := BuildFilePath(f)
-        if FileExist(path)
+        local expectedHash := manifest.Has(f.name) ? manifest[f.name] : ""
+        
+        ; Check if file already exists and passes hash
+        if FileExist(path) && expectedHash && HashVerifier.VerifyFile(path, expectedHash) {
+            Log("[ OK ] " . f.name . " (verified)")
             continue
-        
-        Log("[DL ] " . f.name . "...")
-        
-        ; Download to temp file first (atomic)
-        local tempPath := path . ".tmp"
-        local downloadOk := false
-        
-        try {
-            UrlDownloadToFile(CONFIG.baseUrl . f.name, tempPath)
-            
-            ; Verify file exists and has size > 0
-            if FileExist(tempPath) {
-                local size := FileGetSize(tempPath)
-                if (size > 0) {
-                    FileMove(tempPath, path, 1)  ; Overwrite if exists
-                    downloadOk := true
-                    Log("[ OK ] " . f.name . " (" . FormatFileSize(size) . ")")
-                    success++
-                } else {
-                    FileDelete(tempPath)
-                    Log("[ERR] " . f.name . " - empty file")
-                }
-            } else {
-                Log("[ERR] " . f.name . " - download failed")
-            }
-        } catch as e {
-            if FileExist(tempPath)
-                FileDelete(tempPath)
-            Log("[ERR] " . f.name . " - " . e.Message)
         }
         
-        if !downloadOk {
+        ; Download with retry
+        local downloadOk := DownloadWithRetry(CONFIG.baseUrl . f.name, path, true, expectedHash)
+        
+        if downloadOk {
+            local size := FileGetSize(path)
+            local hashStatus := expectedHash ? " [HASH OK]" : ""
+            Log("[ OK ] " . f.name . " (" . FormatFileSize(size) . ")" . hashStatus)
+            success++
+        } else {
+            Log("[ERR] " . f.name . " - failed after " . CONFIG.maxDownloadRetries . " retries")
             failed++
             failedNames.Push(f.name)
+            if f.required
+                failedRequired.Push(f.name)
+            
+            ; Clean up partial file
+            if FileExist(path)
+                FileDelete(path)
         }
     }
     
     Log("[SYS] ============ COMPLETE ===============")
     Log("[SYS] Downloaded: " . success . " | Failed: " . failed)
     
-    ; Check if required files are still missing
-    for name in missingRequired {
-        local found := false
-        for f in REQUIRED_FILES {
-            if (f.name = name && FileExist(BuildFilePath(f))) {
-                found := true
-                break
+    ; Check required files
+    if failedRequired.Length > 0 {
+        Log("[ERR] Required files missing: " . failedRequired.Join(", "))
+        return false
+    }
+    
+    ; Warn about optional failures
+    if failed > 0 {
+        Log("[WRN] Optional files failed: " . failedNames.Join(", "))
+        Log("[WRN] Internal mode may not work")
+    }
+    
+    return (failedRequired.Length = 0)
+}
+
+; Download with retry and optional hash verification
+DownloadWithRetry(url, destPath, showProgress := true, expectedHash := "") {
+    local tempPath := destPath . ".tmp"
+    local lastError := ""
+    
+    for attempt := 1 to CONFIG.maxDownloadRetries {
+        ; Clean up any previous temp file
+        if FileExist(tempPath)
+            FileDelete(tempPath)
+        
+        if showProgress && (attempt > 1)
+            Log("[DL ] Retry " . attempt . "/" . CONFIG.maxDownloadRetries . "...")
+        
+        try {
+            UrlDownloadToFile(url, tempPath)
+            
+            ; Verify file exists and has size > 0
+            if !FileExist(tempPath) {
+                lastError := "Download returned but no file"
+                Sleep(CONFIG.downloadRetryDelay)
+                continue
             }
-        }
-        if !found {
-            Log("[ERR] Required file missing: " . name)
-            return false
+            
+            local size := FileGetSize(tempPath)
+            if (size = 0) {
+                FileDelete(tempPath)
+                lastError := "Empty file"
+                Sleep(CONFIG.downloadRetryDelay)
+                continue
+            }
+            
+            ; Hash verification if provided
+            if expectedHash {
+                if !HashVerifier.VerifyFile(tempPath, expectedHash) {
+                    FileDelete(tempPath)
+                    lastError := "Hash mismatch"
+                    Log("[WRN] Hash verification failed")
+                    Sleep(CONFIG.downloadRetryDelay)
+                    continue
+                }
+            }
+            
+            ; Success - move temp to final location
+            if FileExist(destPath)
+                FileDelete(destPath)
+            FileMove(tempPath, destPath, 1)
+            return true
+            
+        } catch as e {
+            lastError := e.Message
+            if FileExist(tempPath)
+                FileDelete(tempPath)
+            Sleep(CONFIG.downloadRetryDelay)
         }
     }
     
-    return (failed = 0)
+    Log("[ERR] Failed: " . lastError)
+    return false
 }
 
 BuildFilePath(fileDef) {
@@ -154,33 +332,26 @@ FormatFileSize(bytes) {
     return Round(bytes / 1048576, 1) . " MB"
 }
 
-; ===== SAFE STRING TO BUFFER =====
+; ===== DLL CALLS (explicit return types) =====
 
-StringToBuffer(str, encoding := "UTF-8") {
-    ; StrPut returns size INCLUDING null terminator
-    local size := StrPut(str, encoding)
-    local buf := Buffer(size)
-    StrPut(str, buf, encoding)
-    return buf
-}
-
-; ===== DLL CALLS =====
-
+; void Initialize(void) - no return value
 Initialize() {
     if !FileExist(CONFIG.dllPath) {
         Log("[ERR] Cloudy.dll missing - run REINSTALL")
         return false
     }
     try {
-        local result := DllCall(CONFIG.dllPath "\Initialize", "CDecl")
-        Log("[ OK ] Initialized (return: " . result . ")")
+        ; Explicit "Ptr" return type (actually void, but AHK needs a type)
+        DllCall(CONFIG.dllPath "\Initialize", "CDecl", "Ptr")
+        Log("[ OK ] Initialized")
         return true
     } catch as e {
-        Log("[ERR] Init failed: " . e.Message)
+        Log("[ERR] Init failed: " . e.Message . " (LastError: " . A_LastError . ")")
         return false
     }
 }
 
+; void ExecuteAsync(byte* script, char** clients, int numClients)
 ExecuteScript(script) {
     if !STATE.isRegistered {
         Log("[ERR] Not registered - click INIT first")
@@ -207,27 +378,29 @@ ExecuteScript(script) {
     }
     
     try {
-        local result := DllCall(CONFIG.dllPath "\ExecuteAsync", 
+        ; Explicit return type "Ptr" (actually void)
+        DllCall(CONFIG.dllPath "\ExecuteAsync", 
             "CDecl", 
-            "Ptr", scriptBuf.Ptr,
-            "Ptr", ptrArray.Ptr,
-            "Int", numClients)
-        Log("[ OK ] Script executed (return: " . result . ")")
+            "Ptr", scriptBuf.Ptr,       ; byte* scriptSource
+            "Ptr", ptrArray.Ptr,         ; char** clientUsers
+            "Int", numClients,           ; int numUsers
+            "Ptr")                       ; return type
+        Log("[ OK ] Script executed")
         return true
     } catch as e {
-        Log("[ERR] Execute failed: " . e.Message)
+        Log("[ERR] Execute failed: " . e.Message . " (LastError: " . A_LastError . ")")
         return false
     }
 }
 
-; ===== CLIENT LIST PARSING =====
-; Expected native struct layout (x64):
-; Offset 0x00: char* version  (8 bytes)
-; Offset 0x08: char* name     (8 bytes)  
-; Offset 0x10: int   id       (4 bytes)
-; Offset 0x14: padding        (4 bytes)
-; Total: 24 bytes
-; NOTE: This may vary - verify against actual DLL
+; ClientInfo* GetClients(void) - returns pointer to struct array
+; Struct layout (x64):
+;   Offset 0x00: char* version  (8 bytes)
+;   Offset 0x08: char* name     (8 bytes)
+;   Offset 0x10: int   id       (4 bytes)
+;   Offset 0x14: int   padding  (4 bytes)
+;   Total: 24 bytes
+; NOTE: x86 would be 12 bytes (4+4+4), no padding needed
 
 GetClients() {
     local clients := []
@@ -236,31 +409,76 @@ GetClients() {
         return clients
     
     try {
+        ; Explicit "Ptr" return type for struct pointer
         local ptr := DllCall(CONFIG.dllPath "\GetClients", "CDecl", "Ptr")
-        if !ptr
-            return clients
         
-        ; Use A_PtrSize to handle x86/x64 differences
-        local structSize := (A_PtrSize * 2) + 4 + ((A_PtrSize = 4) ? 0 : 4)  ; Align to 8 on x64
+        if !ptr {
+            Log("[WRN] GetClients returned null")
+            return clients
+        }
+        
+        ; Calculate struct size based on pointer size
+        local ptrSize := A_PtrSize
+        local intSize := 4
+        local structSize := (ptrSize * 2) + intSize
+        ; Align to pointer size boundary
+        if (Mod(structSize, ptrSize) != 0)
+            structSize += (ptrSize - Mod(structSize, ptrSize))
+        
         local maxClients := 50
+        local parsedOk := true
         
         loop maxClients {
             local offset := (A_Index - 1) * structSize
             
-            local namePtr := NumGet(ptr + offset + A_PtrSize, "Ptr")
+            ; Safety: check if we can read this far
+            ; Read name pointer first - if null, end of list
+            local namePtr := 0
+            try {
+                namePtr := NumGet(ptr + offset + ptrSize, "Ptr")
+            } catch {
+                Log("[WRN] GetClients: read error at offset " . offset)
+                parsedOk := false
+                break
+            }
+            
             if !namePtr
                 break  ; Null name = end of list
             
-            local versionPtr := NumGet(ptr + offset, "Ptr")
-            local id := NumGet(ptr + offset + (A_PtrSize * 2), "Int")
+            ; Read other fields
+            local versionPtr := 0
+            local id := 0
             
-            local version := (versionPtr ? StrGet(versionPtr, "UTF-8") : "")
-            local name := StrGet(namePtr, "UTF-8")
+            try {
+                versionPtr := NumGet(ptr + offset, "Ptr")
+                id := NumGet(ptr + offset + (ptrSize * 2), "Int")
+            } catch as e {
+                Log("[WRN] GetClients: struct read error - " . e.Message)
+                parsedOk := false
+                break
+            }
+            
+            ; Validate pointers before reading strings
+            local version := ""
+            local name := ""
+            
+            try {
+                name := StrGet(namePtr, "UTF-8")
+                if versionPtr
+                    version := StrGet(versionPtr, "UTF-8")
+            } catch as e {
+                Log("[WRN] GetClients: string read error - " . e.Message)
+                break
+            }
             
             clients.Push({name: name, version: version, id: id})
         }
+        
+        if !parsedOk
+            Log("[WRN] GetClients: partial parse, may have corrupt data")
+            
     } catch as e {
-        Log("[WRN] GetClients error: " . e.Message)
+        Log("[ERR] GetClients exception: " . e.Message)
     }
     
     return clients
@@ -295,16 +513,20 @@ Register(msg) {
 ; ===== PROCESS HELPERS =====
 
 IsRobloxOpen() {
+    STATE.robloxPids := []
+    
     try {
         local wmi := ComObjGet("winmgmts:")
         local query := wmi.ExecQuery("Select ProcessId from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        
         for p in query {
-            STATE.robloxPid := p.ProcessId
-            return true
+            STATE.robloxPids.Push(p.ProcessId)
         }
+    } catch as e {
+        Log("[WRN] WMI query failed: " . e.Message)
     }
-    STATE.robloxPid := 0
-    return false
+    
+    return STATE.robloxPids.Length > 0
 }
 
 GetUsername() {
@@ -326,19 +548,21 @@ KillRoblox() {
             try {
                 p.Terminate()
                 killed++
+            } catch as e {
+                Log("[WRN] Failed to terminate PID " . p.ProcessId . ": " . e.Message)
             }
         }
     }
     if killed {
         Log("[SYS] Terminated " . killed . " process(es)")
         STATE.injected := false
-        STATE.robloxPid := 0
+        STATE.robloxPids := []
     } else {
         Log("[SYS] No Roblox processes found")
     }
 }
 
-; ===== FILE LOGGING =====
+; ===== FILE LOGGING (with error reporting) =====
 
 LogToFile(msg) {
     try {
@@ -355,6 +579,10 @@ LogToFile(msg) {
         
         local ts := Format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", A_Year, A_Mon, A_MDay, A_Hour, A_Min, A_Sec)
         FileAppend(ts . " " . msg . "`n", CONFIG.logFile, "UTF-8")
+        STATE.lastLogWriteOk := true
+    } catch as e {
+        STATE.lastLogWriteOk := false
+        ; Don't recurse - just set flag for GUI to show
     }
 }
 
@@ -368,7 +596,7 @@ Log(msg) {
     if STATE.consoleLines.Length > CONFIG.maxLogLines
         STATE.consoleLines.RemoveAt(1)
     
-    ; Log to file too
+    ; Log to file
     LogToFile(msg)
     
     ; Update GUI
@@ -380,9 +608,21 @@ Log(msg) {
             STATE.gui["_Console"].Value := out
             STATE.gui["_Console"].EditSelStart := StrLen(out) - 1
         }
+        
+        ; Show log write status
+        UpdateLogStatus()
     }
     
     UpdateStatus()
+}
+
+UpdateLogStatus() {
+    if !STATE.gui
+        return
+    
+    local status := STATE.lastLogWriteOk ? "" : " [LOG ERR]"
+    STATE.gui["_LogStatus"].Value := status
+    STATE.gui["_LogStatus"].Opt(STATE.lastLogWriteOk ? "c004400" : "cff0000")
 }
 
 UpdateStatus() {
@@ -392,7 +632,6 @@ UpdateStatus() {
     local status := "IDLE"
     local color := "c808080"
     
-    ; Priority: injected > registered > idle
     if STATE.injected {
         status := "INJECTED"
         color := "c00ff00"
@@ -411,9 +650,25 @@ UpdateInfo() {
     
     local username := GetUsername()
     local clients := GetClients()
-    local pid := STATE.robloxPid ? STATE.robloxPid : "---"
+    local pidStr := STATE.robloxPids.Length > 0 ? STATE.robloxPids[1] : "---"
     
-    STATE.gui["_Info"].Value := "USER: " . (username ? username : "---") . " | PID: " . pid . " | CLIENTS: " . clients.Length
+    STATE.gui["_Info"].Value := "USER: " . (username ? username : "---") . " | PID: " . pidStr . " | CLIENTS: " . clients.Length
+}
+
+; Periodic client refresh
+StartClientRefresh() {
+    STATE.clientRefreshTimer := 0
+    SetTimer(RefreshClients, 5000)  ; Every 5 seconds
+}
+
+StopClientRefresh() {
+    SetTimer(RefreshClients, 0)
+}
+
+RefreshClients() {
+    if !STATE.gui || !STATE.injected
+        return
+    UpdateInfo()
 }
 
 ; ===== CRT EFFECT =====
@@ -446,67 +701,63 @@ BuildGUI() {
     g.SetFont("s10", "Courier New")
     
     ; Top border
-    g.Add("Text", "w520 h2 c00ff00", UI.topBorder)
+    g.Add("Text", "w520 h2 c00ff00", CONFIG.topBorder)
     
     ; Logo
-    g.Add("Text", "w520 h90 c00ff00 Center", UI.logo)
+    g.Add("Text", "w520 h80 c00ff00 Center", CONFIG.logo)
     
     ; Separator
-    g.Add("Text", "w520 h2 c00ff00", UI.separator)
+    g.Add("Text", "w520 h2 c00ff00", CONFIG.separator)
     
     ; Status section
     g.Add("Text", "w520 h16 c00ff00", "STATUS:")
     g.Add("Text", "w520 h22 v_Status c808080", "* IDLE")
     g.Add("Text", "w520 h16 v_Info c00aa00", "USER: --- | PID: --- | CLIENTS: 0")
+    g.Add("Text", "w520 h14 v_LogStatus c004400 Right", "")
     
     ; Separator
-    g.Add("Text", "w520 h2 c004400", UI.thinSep)
+    g.Add("Text", "w520 h2 c004400", CONFIG.thinSep)
     
     ; Script section
     g.Add("Text", "w520 h16 c00ff00", "[ SCRIPT INPUT ]")
-    g.Add("Edit", "w520 h130 v_Code -Wrap c00ff00 Background0a0a0a", "
-print('hello from cloudy')
-game:GetService('StarterGui'):SetCore(
-  'SendNotification', {
-    Title = 'CLOUDY',
-    Text = 'working!'
-  }
-)")
+    g.Add("Edit", "w520 h120 v_Code -Wrap c00ff00 Background0a0a0a", CONFIG.defaultScript)
     
     ; Separator
-    g.Add("Text", "w520 h2 c004400", UI.thinSep)
+    g.Add("Text", "w520 h2 c004400", CONFIG.thinSep)
     
     ; Button row 1
-    g.Add("Button", "w120 h26 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => (Register("CLOUDY"), Initialize(), UpdateInfo()))
-    g.Add("Button", "x+6 w120 h26 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => (Inject(), UpdateInfo()))
-    g.Add("Button", "x+6 w120 h26 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => ExecuteScript(g["_Code"].Value))
-    g.Add("Button", "x+6 w120 h26 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (STATE.consoleLines := [], g["_Console"].Value := ""))
+    g.Add("Button", "w90 h26 c000000 Background00aa00", "[INIT]").OnEvent("Click", (*) => (Register("CLOUDY"), Initialize(), UpdateInfo()))
+    g.Add("Button", "x+4 w90 h26 c000000 Background00aa00", "[INJECT]").OnEvent("Click", (*) => (Inject(), UpdateInfo(), StartClientRefresh()))
+    g.Add("Button", "x+4 w90 h26 c000000 Background008800", "[EXEC]").OnEvent("Click", (*) => ExecuteScript(g["_Code"].Value))
+    g.Add("Button", "x+4 w90 h26 c000000 Background006600", "[REFRESH]").OnEvent("Click", (*) => UpdateInfo())
+    g.Add("Button", "x+4 w90 h26 c000000 Background444400", "[CLEAR]").OnEvent("Click", (*) => (STATE.consoleLines := [], g["_Console"].Value := ""))
     
     ; Button row 2
-    g.Add("Button", "w184 h26 c000000 Background444400 y+3", "[ REINSTALL FILES ]").OnEvent("Click", (*) => AutoSetup())
-    g.Add("Button", "x+6 w160 h26 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
-    g.Add("Button", "x+6 w148 h26 c000000 Background333333", "[ EXIT ]").OnEvent("Click", (*) => ExitApp())
+    g.Add("Button", "w184 h26 c000000 Background444400 y+3", "[REINSTALL FILES]").OnEvent("Click", (*) => AutoSetup())
+    g.Add("Button", "x+4 w160 h26 c000000 Background440000", "[KILL ROBLOX]").OnEvent("Click", (*) => KillRoblox())
+    g.Add("Button", "x+4 w148 h26 c000000 Background333333", "[EXIT]").OnEvent("Click", (*) => ExitApp())
     
     ; Separator
-    g.Add("Text", "w520 h2 c004400", UI.thinSep)
+    g.Add("Text", "w520 h2 c004400", CONFIG.thinSep)
     
     ; Console section
     g.Add("Text", "w520 h16 c00ff00", "[ CONSOLE OUTPUT ]")
-    g.Add("Edit", "w520 h140 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
+    g.Add("Edit", "w520 h130 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
     
     ; Bottom border
-    g.Add("Text", "w520 h2 c00ff00", UI.topBorder)
+    g.Add("Text", "w520 h2 c00ff00", CONFIG.topBorder)
     
     ; Footer
-    g.Add("Text", "w520 h14 c004400 Center", UI.footer)
+    g.Add("Text", "w520 h14 c004400 Center", CONFIG.footer)
     
-    g.Show("w540 h680", "CLOUDY // TERMINAL")
+    g.Show("w540 h660", "CLOUDY // TERMINAL")
     
     HotKey("Escape", (*) => ExitApp())
 }
 
 ExitApp() {
     StopCRTEffect()
+    StopClientRefresh()
     if STATE.gui
         STATE.gui.Destroy()
     ExitApp()
@@ -516,7 +767,7 @@ ExitApp() {
 
 BootSequence() {
     Sleep(200)
-    Log("[SYS] CLOUDY TERMINAL v1.1")
+    Log("[SYS] CLOUDY TERMINAL v1.2")
     Sleep(80)
     Log("[SYS] Initializing subsystems...")
     Sleep(100)
@@ -528,7 +779,8 @@ BootSequence() {
     Sleep(150)
     
     if IsRobloxOpen() {
-        Log("[SYS] ROBLOX: DETECTED (PID " . STATE.robloxPid . ")")
+        local pidList := STATE.robloxPids.Join(", ")
+        Log("[SYS] ROBLOX: DETECTED (PID " . pidList . ")")
     } else {
         Log("[SYS] ROBLOX: NOT FOUND")
         Log("[SYS] Start Roblox before injecting")
@@ -544,10 +796,11 @@ BootSequence() {
 
 BuildGUI()
 
-; Run setup and check result
-if !AutoSetup() {
-    Log("[WRN] Some files failed to download")
-    Log("[WRN] Click REINSTALL to retry")
+; Run setup and handle result
+local setupOk := AutoSetup()
+if !setupOk {
+    Log("[WRN] Setup incomplete - some features may not work")
+    Log("[WRN] Click REINSTALL FILES to retry")
 }
 
 BootSequence()
