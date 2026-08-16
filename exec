@@ -37,6 +37,9 @@ global STATE := {
     robloxDetected: false
 }
 
+; ===== CONSTANTS =====
+global INVALID_HANDLE_VALUE := -1
+
 ; ===== SAFETY CHECKS =====
 
 ValidateEnvironment() {
@@ -48,7 +51,8 @@ ValidateEnvironment() {
         return false
     }
     
-    if (A_IsCompiled && !FileExist(A_ScriptDir . "\bin")) {
+    ; FIXED: Use DirExist for directory check
+    if (A_IsCompiled && !DirExist(A_ScriptDir . "\bin")) {
         ShowFatalError("Compiled script detected but bin folder missing.`nExtract files properly.")
         return false
     }
@@ -61,7 +65,6 @@ ShowFatalError(msg) {
     ExitApp()
 }
 
-; FIXED: Added catch block
 SafeFileExists(path) {
     try {
         return FileExist(path) ? true : false
@@ -70,7 +73,6 @@ SafeFileExists(path) {
     }
 }
 
-; FIXED: Added catch block
 SafeFileSize(path) {
     try {
         if !FileExist(path)
@@ -83,8 +85,9 @@ SafeFileSize(path) {
 
 IsFileInUse(filePath) {
     try {
+        ; FIXED: Use WStr for wide Unicode string
         local handle := DllCall("kernel32.dll\CreateFileW", 
-            "Str", filePath,
+            "WStr", filePath,
             "UInt", 0x80000000,
             "UInt", 0,
             "Ptr", 0,
@@ -92,7 +95,8 @@ IsFileInUse(filePath) {
             "UInt", 0x80,
             "Ptr", 0, "Ptr")
         
-        if (handle = -1)
+        ; FIXED: Use named constant for clarity
+        if (handle = INVALID_HANDLE_VALUE)
             return true
         
         DllCall("kernel32.dll\CloseHandle", "Ptr", handle)
@@ -215,7 +219,6 @@ DownloadFile(filename, destPath) {
             local success := WinHttpDownload(url, tmpPath)
             
             if !success {
-                ; FIXED: Check UrlDownloadToFile return value
                 local dlResult := UrlDownloadToFile(url, tmpPath)
                 if (dlResult = 0)
                     success := true
@@ -248,23 +251,29 @@ DownloadFile(filename, destPath) {
     return false
 }
 
-; FIXED: Use synchronous request (XMLHTTP doesn't have WaitForResponse)
+; FIXED: Added status and error logging
 WinHttpDownload(url, destPath) {
     try {
         local whr := ComObjCreate("Msxml2.XMLHTTP")
-        whr.Open("GET", url, false)  ; Synchronous
+        whr.Open("GET", url, false)
         whr.Send()
         
         if (whr.Status = 200) {
             local adodb := ComObjCreate("ADODB.Stream")
-            adodb.Type := 1  ; adTypeBinary
+            adodb.Type := 1
             adodb.Open()
             adodb.Write(whr.ResponseBody)
-            adodb.SaveToFile(destPath, 2)  ; adSaveCreateOverWrite
+            adodb.SaveToFile(destPath, 2)
             adodb.Close()
             return true
+        } else {
+            ; FIXED: Log non-200 status
+            Log("[WRN] HTTP " . whr.Status . " for " . url)
         }
-    } catch {
+    } catch as e {
+        ; FIXED: Log exceptions
+        STATE.lastError := "WinHTTP: " . e.Message
+        Log("[WRN] WinHTTP error: " . e.Message)
     }
     return false
 }
@@ -290,8 +299,11 @@ Initialize() {
     }
     
     try {
-        ; FIXED: Added dot for concatenation
         local result := DllCall(CONFIG.dllPath . "\Initialize", "Int", "CDecl")
+        ; FIXED: Check and log return value
+        if (result != 0) {
+            Log("[WRN] Initialize returned: " . result)
+        }
         Log("[ OK ] Initialized")
         return true
     } catch as e {
@@ -302,7 +314,6 @@ Initialize() {
 }
 
 ExecuteScript(script) {
-    ; FIXED: Use STATE.isRegistered
     if !STATE.isRegistered {
         Log("[ERR] Not registered - click INIT first")
         return false
@@ -342,7 +353,6 @@ ExecuteScript(script) {
     local scriptBytes := Buffer(scriptSize)
     StrPut(script, scriptBytes, "UTF-8")
 
-    ; FIXED: Build compact list to avoid NULL holes in ptrArray
     local stringBuffers := []
     local ptrList := []
     
@@ -369,8 +379,11 @@ ExecuteScript(script) {
         NumPut(p, ptrBuf, (i - 1) * A_PtrSize, "Ptr")
     
     try {
-        ; FIXED: Added dot for concatenation
-        DllCall(CONFIG.dllPath . "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrBuf.Ptr, "Int", numClients, "CDecl")
+        local result := DllCall(CONFIG.dllPath . "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrBuf.Ptr, "Int", numClients, "CDecl")
+        ; FIXED: Check and log return value
+        if (result != 0) {
+            Log("[WRN] ExecuteAsync returned: " . result)
+        }
         Log("[ OK ] Script executed")
         return true
     } catch as e {
@@ -386,7 +399,6 @@ GetClients() {
         return clients
     
     try {
-        ; FIXED: Added dot for concatenation
         local ptr := DllCall(CONFIG.dllPath . "\GetClients", "Ptr", "CDecl")
         if !ptr
             return clients
@@ -439,7 +451,6 @@ GetClients() {
 }
 
 Inject() {
-    ; FIXED: Use STATE.isRegistered
     if !STATE.isRegistered
         Register("CLOUDY")
     
@@ -457,7 +468,6 @@ Inject() {
     local result := ExecuteScript(notif)
     
     if result {
-        ; FIXED: Use STATE.injected
         STATE.injected := true
         Log("[SYS] Injection complete")
     }
@@ -466,7 +476,6 @@ Inject() {
 }
 
 Register(msg) {
-    ; FIXED: Use STATE.* for all state
     STATE.injectMessage := msg
     STATE.isRegistered := true
     Log("[ OK ] Registered: " . msg)
@@ -520,7 +529,6 @@ KillRoblox() {
     
     if killed {
         Log("[SYS] Terminated " . killed . " process(es)")
-        ; FIXED: Use STATE.injected
         STATE.injected := false
         STATE.robloxDetected := false
     } else {
@@ -558,13 +566,13 @@ UpdateGUIConsole() {
 }
 
 UpdateStatus() {
+    ; FIXED: Safe GUI access check
     if !STATE.gui
         return
     
     local status := "IDLE"
     local color := "c808080"
     
-    ; FIXED: All checks use STATE.*
     if STATE.injected {
         status := "INJECTED"
         color := "c00ff00"
@@ -583,12 +591,15 @@ UpdateStatus() {
 }
 
 UpdateInfo() {
+    ; FIXED: Safe GUI access check
     if !STATE.gui
         return
     local username := GetUsername()
     local clients := GetClients()
     local rbxStatus := STATE.robloxDetected ? "YES" : "NO"
-    STATE.gui["_Info"].Value := "USER: " . (username ? username : "---") . " | ROBLOX: " . rbxStatus . " | CLIENTS: " . clients.Length
+    try {
+        STATE.gui["_Info"].Value := "USER: " . (username ? username : "---") . " | ROBLOX: " . rbxStatus . " | CLIENTS: " . clients.Length
+    }
 }
 
 ; ===== CRT EFFECT =====
@@ -602,8 +613,10 @@ CRTFlash() {
     if !STATE.gui
         return
     try {
-        if (Mod(STATE.animPhase, 10) = 0)
-            STATE.gui.Opt("+Border " . (Mod(STATE.animPhase, 10) = 0 ? "0x003300" : "0x002200"))
+        ; FIXED: Proper toggle logic - changes every 10 phases, alternates color
+        if (Mod(STATE.animPhase, 10) = 0) {
+            STATE.gui.Opt("+Border " . (Mod(STATE.animPhase, 20) = 0 ? "0x003300" : "0x002200"))
+        }
     }
 }
 
@@ -633,7 +646,7 @@ BuildGUI() {
     g.Add("Button", "w120 h28 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => SafeInit())
     g.Add("Button", "x+8 w120 h28 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => SafeInject())
     g.Add("Button", "x+8 w120 h28 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => SafeExecute())
-    g.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (STATE.consoleLines := [], g["_Console"].Value := ""))
+    g.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => SafeClear())
     
     g.Add("Button", "w184 h28 c000000 Background444400 y+4", "[ REINSTALL FILES ]").OnEvent("Click", (*) => SafeReinstall())
     g.Add("Button", "x+8 w160 h28 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
@@ -644,7 +657,7 @@ BuildGUI() {
     g.Add("Edit", "w520 h140 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
     
     g.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    g.Add("Text", "w520 h16 c004400 Center", "v1.2 // CLOUDY x NYX // [ESC] EXIT")
+    g.Add("Text", "w520 h16 c004400 Center", "v1.3 // CLOUDY x NYX // [ESC] EXIT")
     
     g.Show("w540 h720", "CLOUDY // TERMINAL")
     HotKey("Escape", (*) => QuitApp())
@@ -652,7 +665,9 @@ BuildGUI() {
 
 SafeInit() {
     STATE.lastError := ""
-    STATE.gui["_Error"].Value := ""
+    ; FIXED: Safe GUI access
+    if STATE.gui
+        try STATE.gui["_Error"].Value := ""
     Register("CLOUDY")
     Initialize()
     UpdateInfo()
@@ -660,10 +675,12 @@ SafeInit() {
 
 SafeInject() {
     STATE.lastError := ""
-    STATE.gui["_Error"].Value := ""
+    if STATE.gui
+        try STATE.gui["_Error"].Value := ""
     if !STATE.setupComplete {
         Log("[ERR] Setup incomplete")
-        STATE.gui["_Error"].Value := "Setup incomplete - click REINSTALL"
+        if STATE.gui
+            try STATE.gui["_Error"].Value := "Setup incomplete - click REINSTALL"
         return
     }
     Inject()
@@ -672,19 +689,32 @@ SafeInject() {
 
 SafeExecute() {
     STATE.lastError := ""
-    STATE.gui["_Error"].Value := ""
+    if STATE.gui
+        try STATE.gui["_Error"].Value := ""
+    if !STATE.gui {
+        Log("[ERR] GUI not available")
+        return
+    }
     local code := STATE.gui["_Code"].Value
     if (StrLen(Trim(code)) = 0) {
         Log("[ERR] No script entered")
-        STATE.gui["_Error"].Value := "No script entered"
+        try STATE.gui["_Error"].Value := "No script entered"
         return
     }
     ExecuteScript(code)
 }
 
+; FIXED: Extracted to safe function
+SafeClear() {
+    STATE.consoleLines := []
+    if STATE.gui
+        try STATE.gui["_Console"].Value := ""
+}
+
 SafeReinstall() {
     STATE.lastError := ""
-    STATE.gui["_Error"].Value := ""
+    if STATE.gui
+        try STATE.gui["_Error"].Value := ""
     STATE.setupComplete := false
     AutoSetup()
     UpdateInfo()
@@ -701,7 +731,7 @@ QuitApp() {
 
 BootSequence() {
     Sleep(300)
-    Log("[SYS] CLOUDY TERMINAL v1.2")
+    Log("[SYS] CLOUDY TERMINAL v1.3")
     Sleep(100)
     Log("[SYS] INITIALIZING...")
     Sleep(150)
