@@ -40,25 +40,17 @@ global STATE := {
 ; ===== SAFETY CHECKS =====
 
 ValidateEnvironment() {
-    ; Check AHK version
     local v := A_AhkVersion
     local parts := StrSplit(v, ".")
-    if (parts[1] < 2) {
+    local major := parts[1] + 0
+    if (major < 2) {
         ShowFatalError("AHK v2.0+ required. You have v" . v)
         return false
     }
     
-    ; Check if running as script (not compiled without files)
     if (A_IsCompiled && !FileExist(A_ScriptDir . "\bin")) {
         ShowFatalError("Compiled script detected but bin folder missing.`nExtract files properly.")
         return false
-    }
-    
-    ; Check internet connectivity (basic)
-    try {
-        DllCall("wininet.dll\InternetGetConnectedState", "UIntP", 0, "UInt", 0)
-    } catch {
-        Log("[WRN] Cannot verify internet connectivity")
     }
     
     return true
@@ -69,20 +61,24 @@ ShowFatalError(msg) {
     ExitApp()
 }
 
+; FIXED: Added catch block
 SafeFileExists(path) {
     try {
         return FileExist(path) ? true : false
+    } catch {
+        return false
     }
-    return false
 }
 
+; FIXED: Added catch block
 SafeFileSize(path) {
     try {
         if !FileExist(path)
             return 0
         return FileGetSize(path)
+    } catch {
+        return 0
     }
-    return 0
 }
 
 IsFileInUse(filePath) {
@@ -96,7 +92,7 @@ IsFileInUse(filePath) {
             "UInt", 0x80,
             "Ptr", 0, "Ptr")
         
-        if (handle = -1 || handle = 0xFFFFFFFF)
+        if (handle = -1)
             return true
         
         DllCall("kernel32.dll\CloseHandle", "Ptr", handle)
@@ -120,9 +116,7 @@ AutoSetup() {
     
     local allGood := true
     local missingRequired := []
-    local invalidRequired := []
     
-    ; Phase 1: Check what's missing or invalid
     for f in REQUIRED_FILES {
         local path := BuildPath(f)
         
@@ -133,11 +127,10 @@ AutoSetup() {
             continue
         }
         
-        ; Validate file size
         if !ValidateFileSize(path, f.minSize) {
-            Log("[WRN] " . f.name . " size invalid (expected >" . FormatFileSize(f.minSize) . ")")
+            Log("[WRN] " . f.name . " size invalid")
             if f.required
-                invalidRequired.Push(f.name)
+                missingRequired.Push(f.name)
             allGood := false
         }
     }
@@ -167,7 +160,6 @@ AutoSetup() {
         if !needsDownload
             continue
         
-        ; Skip if file is locked
         if SafeFileExists(path) && IsFileInUse(path) {
             Log("[SKIP] " . f.name . " is in use")
             if f.required
@@ -180,7 +172,7 @@ AutoSetup() {
                 Log("[ OK ] " . f.name . " (" . FormatFileSize(SafeFileSize(path)) . ")")
                 downloaded++
             } else {
-                Log("[ERR] " . f.name . " downloaded but size invalid")
+                Log("[ERR] " . f.name . " size invalid after download")
                 try FileDelete(path)
                 if f.required
                     failed++
@@ -195,18 +187,11 @@ AutoSetup() {
     Log("[SYS] ═══ COMPLETE ═══")
     Log("[SYS] Downloaded: " . downloaded . " | Failed: " . failed)
     
-    ; Final validation
-    if (missingRequired.Length > 0 || invalidRequired.Length > 0 || failed > 0) {
-        local allMissing := missingRequired.Clone()
-        for m in invalidRequired
-            allMissing.Push(m)
-        
-        if (allMissing.Length > 0) {
-            Log("[ERR] Required files missing/invalid: " . allMissing.Join(", "))
-            STATE.lastError := "Required files missing"
-            STATE.setupComplete := false
-            return false
-        }
+    if (missingRequired.Length > 0 || failed > 0) {
+        Log("[ERR] Required files missing/invalid")
+        STATE.lastError := "Required files missing"
+        STATE.setupComplete := false
+        return false
     }
     
     STATE.setupComplete := true
@@ -217,7 +202,6 @@ DownloadFile(filename, destPath) {
     local url := CONFIG.baseUrl . filename
     local tmpPath := destPath . ".tmp"
     
-    ; Clean up any existing temp
     if SafeFileExists(tmpPath)
         try FileDelete(tmpPath)
     
@@ -228,18 +212,18 @@ DownloadFile(filename, destPath) {
         }
         
         try {
-            ; Use WinHTTP for more reliable downloads
             local success := WinHttpDownload(url, tmpPath)
             
             if !success {
-                ; Fallback to UrlDownloadToFile
-                UrlDownloadToFile(url, tmpPath)
+                ; FIXED: Check UrlDownloadToFile return value
+                local dlResult := UrlDownloadToFile(url, tmpPath)
+                if (dlResult = 0)
+                    success := true
             }
             
-            if SafeFileExists(tmpPath) {
+            if success && SafeFileExists(tmpPath) {
                 local size := SafeFileSize(tmpPath)
                 if (size > 0) {
-                    ; Move to final location
                     if SafeFileExists(destPath) {
                         if IsFileInUse(destPath) {
                             Log("[SKIP] " . filename . " destination locked")
@@ -264,12 +248,12 @@ DownloadFile(filename, destPath) {
     return false
 }
 
+; FIXED: Use synchronous request (XMLHTTP doesn't have WaitForResponse)
 WinHttpDownload(url, destPath) {
     try {
         local whr := ComObjCreate("Msxml2.XMLHTTP")
-        whr.Open("GET", url, true)
+        whr.Open("GET", url, false)  ; Synchronous
         whr.Send()
-        whr.WaitForResponse(CONFIG.downloadTimeout / 1000)
         
         if (whr.Status = 200) {
             local adodb := ComObjCreate("ADODB.Stream")
@@ -280,6 +264,7 @@ WinHttpDownload(url, destPath) {
             adodb.Close()
             return true
         }
+    } catch {
     }
     return false
 }
@@ -304,12 +289,9 @@ Initialize() {
         return false
     }
     
-    if IsFileInUse(CONFIG.dllPath) && !STATE.isRegistered {
-        Log("[WRN] Cloudy.dll locked by another process")
-    }
-    
     try {
-        local result := DllCall(CONFIG.dllPath "\Initialize", "Int", "CDecl")
+        ; FIXED: Added dot for concatenation
+        local result := DllCall(CONFIG.dllPath . "\Initialize", "Int", "CDecl")
         Log("[ OK ] Initialized")
         return true
     } catch as e {
@@ -320,8 +302,8 @@ Initialize() {
 }
 
 ExecuteScript(script) {
-    ; Input validation
-    if !isRegistered {
+    ; FIXED: Use STATE.isRegistered
+    if !STATE.isRegistered {
         Log("[ERR] Not registered - click INIT first")
         return false
     }
@@ -332,11 +314,10 @@ ExecuteScript(script) {
     }
     
     if (StrLen(script) > CONFIG.maxScriptSize) {
-        Log("[ERR] Script too large (" . StrLen(script) . " chars, max " . CONFIG.maxScriptSize . ")")
+        Log("[ERR] Script too large (" . StrLen(script) . " chars)")
         return false
     }
     
-    ; Large script confirmation
     if (StrLen(script) > CONFIG.largeScriptThreshold) {
         local choice := MsgBox(
             "Large script detected (" . StrLen(script) . " characters).`n`nExecute anyway?",
@@ -352,7 +333,6 @@ ExecuteScript(script) {
         return false
     }
     
-    ; Safe buffer allocation
     local scriptSize := StrPut(script, "UTF-8")
     if (scriptSize = 0) {
         Log("[ERR] Failed to encode script")
@@ -362,26 +342,35 @@ ExecuteScript(script) {
     local scriptBytes := Buffer(scriptSize)
     StrPut(script, scriptBytes, "UTF-8")
 
-    local numClients := clients.Length
-    local ptrArray := Buffer(numClients * A_PtrSize)
-    local stringBuffers := []  ; Prevent GC
+    ; FIXED: Build compact list to avoid NULL holes in ptrArray
+    local stringBuffers := []
+    local ptrList := []
     
-    for i, c in clients {
+    for _, c in clients {
         if (StrLen(c.name) = 0)
             continue
-            
         local nameSize := StrPut(c.name, "UTF-8")
         if (nameSize = 0)
             continue
-            
         local buf := Buffer(nameSize)
         StrPut(c.name, buf, "UTF-8")
         stringBuffers.Push(buf)
-        NumPut(buf.Ptr, ptrArray, (i - 1) * A_PtrSize, "Ptr")
+        ptrList.Push(buf.Ptr)
     }
     
+    local numClients := ptrList.Length
+    if (numClients = 0) {
+        Log("[ERR] No valid clients")
+        return false
+    }
+    
+    local ptrBuf := Buffer(numClients * A_PtrSize)
+    for i, p in ptrList
+        NumPut(p, ptrBuf, (i - 1) * A_PtrSize, "Ptr")
+    
     try {
-        DllCall(CONFIG.dllPath "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients, "CDecl")
+        ; FIXED: Added dot for concatenation
+        DllCall(CONFIG.dllPath . "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrBuf.Ptr, "Int", numClients, "CDecl")
         Log("[ OK ] Script executed")
         return true
     } catch as e {
@@ -397,11 +386,11 @@ GetClients() {
         return clients
     
     try {
-        local ptr := DllCall(CONFIG.dllPath "\GetClients", "Ptr", "CDecl")
+        ; FIXED: Added dot for concatenation
+        local ptr := DllCall(CONFIG.dllPath . "\GetClients", "Ptr", "CDecl")
         if !ptr
             return clients
         
-        ; Calculate struct size safely
         local structSize := (A_PtrSize * 2) + 4
         if (Mod(structSize, A_PtrSize) != 0)
             structSize += (A_PtrSize - Mod(structSize, A_PtrSize))
@@ -409,7 +398,6 @@ GetClients() {
         loop 50 {
             local offset := (A_Index - 1) * structSize
             
-            ; Read name pointer first - null means end of list
             local namePtr := 0
             try {
                 namePtr := NumGet(ptr, offset + A_PtrSize, "Ptr")
@@ -420,7 +408,6 @@ GetClients() {
             if !namePtr
                 break
             
-            ; Validate pointer is in reasonable range
             if (namePtr < 0x10000 || namePtr > 0x7FFFFFFFFFFF)
                 break
             
@@ -452,7 +439,8 @@ GetClients() {
 }
 
 Inject() {
-    if !isRegistered
+    ; FIXED: Use STATE.isRegistered
+    if !STATE.isRegistered
         Register("CLOUDY")
     
     if !STATE.setupComplete {
@@ -469,7 +457,8 @@ Inject() {
     local result := ExecuteScript(notif)
     
     if result {
-        injected := true
+        ; FIXED: Use STATE.injected
+        STATE.injected := true
         Log("[SYS] Injection complete")
     }
     
@@ -477,8 +466,9 @@ Inject() {
 }
 
 Register(msg) {
-    injectMessage := msg
-    isRegistered := true
+    ; FIXED: Use STATE.* for all state
+    STATE.injectMessage := msg
+    STATE.isRegistered := true
     Log("[ OK ] Registered: " . msg)
 }
 
@@ -530,7 +520,8 @@ KillRoblox() {
     
     if killed {
         Log("[SYS] Terminated " . killed . " process(es)")
-        injected := false
+        ; FIXED: Use STATE.injected
+        STATE.injected := false
         STATE.robloxDetected := false
     } else {
         Log("[SYS] No Roblox processes found")
@@ -573,10 +564,11 @@ UpdateStatus() {
     local status := "IDLE"
     local color := "c808080"
     
-    if injected {
+    ; FIXED: All checks use STATE.*
+    if STATE.injected {
         status := "INJECTED"
         color := "c00ff00"
-    } else if isRegistered {
+    } else if STATE.isRegistered {
         status := "READY"
         color := "cffff00"
     } else if STATE.setupComplete {
@@ -606,12 +598,12 @@ StartCRTEffect() {
 }
 
 CRTFlash() {
-    animPhase++
+    STATE.animPhase++
     if !STATE.gui
         return
     try {
-        if (Mod(animPhase, 10) = 0)
-            STATE.gui.Opt("+Border " . (Mod(animPhase, 20) = 0 ? "0x003300" : "0x002200"))
+        if (Mod(STATE.animPhase, 10) = 0)
+            STATE.gui.Opt("+Border " . (Mod(STATE.animPhase, 10) = 0 ? "0x003300" : "0x002200"))
     }
 }
 
@@ -652,13 +644,12 @@ BuildGUI() {
     g.Add("Edit", "w520 h140 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
     
     g.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    g.Add("Text", "w520 h16 c004400 Center", "v1.1 // CLOUDY x NYX // [ESC] EXIT")
+    g.Add("Text", "w520 h16 c004400 Center", "v1.2 // CLOUDY x NYX // [ESC] EXIT")
     
     g.Show("w540 h720", "CLOUDY // TERMINAL")
     HotKey("Escape", (*) => QuitApp())
 }
 
-; Safe button handlers
 SafeInit() {
     STATE.lastError := ""
     STATE.gui["_Error"].Value := ""
@@ -710,7 +701,7 @@ QuitApp() {
 
 BootSequence() {
     Sleep(300)
-    Log("[SYS] CLOUDY TERMINAL v1.1")
+    Log("[SYS] CLOUDY TERMINAL v1.2")
     Sleep(100)
     Log("[SYS] INITIALIZING...")
     Sleep(150)
@@ -738,7 +729,6 @@ BootSequence() {
 
 ; ===== MAIN =====
 
-; Validate environment first
 if !ValidateEnvironment()
     ExitApp()
 
