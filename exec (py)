@@ -3,10 +3,24 @@ import sys
 import ctypes
 import struct
 import threading
-import requests
+import platform
 from pathlib import Path
-from tkinter import ttk, scrolledtext, messagebox
 from datetime import datetime
+
+# ===== CHECK PLATFORM =====
+if platform.system() != "Windows":
+    print("This application requires Windows.")
+    sys.exit(1)
+
+# ===== CHECK DEPENDENCIES =====
+try:
+    import requests
+except ImportError:
+    print("ERROR: 'requests' module is required.")
+    print("Install it with: pip install requests")
+    sys.exit(1)
+
+from tkinter import ttk, scrolledtext, messagebox
 
 # ===== CONFIG =====
 BASE_URL = "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/"
@@ -40,12 +54,12 @@ def get_script_dir():
 def get_dll_path():
     return get_script_dir() / "bin" / "Cloudy.dll"
 
-def format_size(bytes_size):
-    if bytes_size < 1024:
-        return f"{bytes_size} B"
-    elif bytes_size < 1048576:
-        return f"{bytes_size / 1024:.1f} KB"
-    return f"{bytes_size / 1048576:.1f} MB"
+def format_size(size):
+    if size < 1024:
+        return f"{size} B"
+    elif size < 1048576:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1048576:.1f} MB"
 
 def build_path(file_info):
     base = get_script_dir()
@@ -65,17 +79,25 @@ class CloudyDLL:
             return False, "Cloudy.dll not found"
         try:
             self.dll = ctypes.CDLL(str(dll_path))
+            
+            # Set up function signatures
             self.dll.Initialize.restype = ctypes.c_int
             self.dll.Initialize.argtypes = []
-            self.dll.ExecuteAsync.restype = ctypes.c_int
-            self.dll.ExecuteAsync.argtypes = [
-                ctypes.c_char_p,  # script bytes
-                ctypes.POINTER(ctypes.c_char_p),  # client names
-                ctypes.c_int  # num clients
-            ]
+            
             self.dll.GetClients.restype = ctypes.c_void_p
             self.dll.GetClients.argtypes = []
+            
+            # ExecuteAsync: void ExecuteAsync(byte* script, char** clients, int numClients)
+            self.dll.ExecuteAsync.restype = ctypes.c_int
+            self.dll.ExecuteAsync.argtypes = [
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_char_p),
+                ctypes.c_int
+            ]
+            
             return True, "Loaded"
+        except OSError as e:
+            return False, f"Load failed: {e}"
         except Exception as e:
             return False, str(e)
     
@@ -91,42 +113,61 @@ class CloudyDLL:
             return False, str(e)
     
     def get_clients(self):
+        """Safely read client list from DLL."""
         if not self.dll:
             return []
         
         clients = []
         try:
-            ptr = self.dll.GetClients()
-            if not ptr:
+            raw_ptr = self.dll.GetClients()
+            if not raw_ptr:
                 return clients
             
-            # Struct: char* version, char* name, int id
+            # Calculate struct size: char* version, char* name, int id
+            # With proper alignment for 64-bit
             struct_size = self.ptr_size * 2 + 4
+            # Align to pointer boundary
             if struct_size % self.ptr_size != 0:
                 struct_size += self.ptr_size - (struct_size % self.ptr_size)
+            
+            # Create a pointer type for iteration
+            byte_ptr = ctypes.c_char * (struct_size * 50)
             
             for i in range(50):
                 offset = i * struct_size
                 
-                # Read name pointer
-                name_ptr = ctypes.c_char_p.from_address(ptr + offset + self.ptr_size).value
-                if not name_ptr:
+                try:
+                    # Read name pointer safely
+                    name_ptr_addr = raw_ptr + offset + self.ptr_size
+                    name_ptr = ctypes.c_char_p.from_address(name_ptr_addr).value
+                    
+                    if not name_ptr:
+                        break
+                    
+                    # Read version pointer safely
+                    version_ptr_addr = raw_ptr + offset
+                    version_ptr = ctypes.c_char_p.from_address(version_ptr_addr).value
+                    
+                    # Read id
+                    id_addr = raw_ptr + offset + self.ptr_size * 2
+                    id_bytes = (ctypes.c_ubyte * 4).from_address(id_addr)
+                    id_val = struct.unpack("i", bytes(id_bytes))[0]
+                    
+                    # Decode strings safely
+                    name = name_ptr.decode("utf-8", errors="replace") if name_ptr else ""
+                    version = version_ptr.decode("utf-8", errors="replace") if version_ptr else ""
+                    
+                    # Validate name length
+                    if 0 < len(name) < 100:
+                        clients.append({
+                            "name": name,
+                            "version": version,
+                            "id": id_val
+                        })
+                except (OSError, ValueError):
+                    # Stop if we can't read (invalid memory)
                     break
-                
-                # Read version pointer
-                version_ptr = ctypes.c_char_p.from_address(ptr + offset).value
-                
-                # Read id
-                id_val = struct.unpack_from("i", ctypes.string_at(ptr + offset + self.ptr_size * 2, 4))[0]
-                
-                name = name_ptr.decode("utf-8", errors="replace")
-                version = version_ptr.decode("utf-8", errors="replace") if version_ptr else ""
-                
-                clients.append({
-                    "name": name,
-                    "version": version,
-                    "id": id_val
-                })
+                    
         except Exception as e:
             print(f"GetClients error: {e}")
         
@@ -138,19 +179,26 @@ class CloudyDLL:
         
         clients = self.get_clients()
         if not clients:
-            return False, "No clients"
+            return False, "No clients connected"
         
-        # Build script bytes
+        # Encode script to bytes
         script_bytes = script.encode("utf-8")
         
         # Build client names array
         num_clients = len(clients)
-        names_array = (ctypes.c_char_p * num_clients)()
+        
+        # Create the array type
+        CharPtrArray = ctypes.c_char_p * num_clients
+        names_array = CharPtrArray()
+        
         for i, c in enumerate(clients):
             names_array[i] = c["name"].encode("utf-8")
         
+        # Cast to proper pointer type for the function
+        names_ptr = ctypes.cast(names_array, ctypes.POINTER(ctypes.c_char_p))
+        
         try:
-            result = self.dll.ExecuteAsync(script_bytes, names_array, num_clients)
+            result = self.dll.ExecuteAsync(script_bytes, names_ptr, ctypes.c_int(num_clients))
             if result != 0:
                 return True, f"Warning: returned {result}"
             return True, "Executed"
@@ -160,33 +208,57 @@ class CloudyDLL:
 cloudy = CloudyDLL()
 
 # ===== DOWNLOAD / SETUP =====
-def download_file(url, dest_path, log_func):
-    try:
-        response = requests.get(url, timeout=30, stream=True)
-        response.raise_for_status()
+def download_file(url, dest_path, log_func, retries=1):
+    """Download a file with retry logic."""
+    dest_path = Path(dest_path)
+    
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            log_func(f"[DL ] Retry {attempt}/{retries}: {dest_path.name}")
         
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(dest_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        actual_size = dest_path.stat().st_size
-        return True, actual_size
-    except requests.exceptions.RequestException as e:
-        return False, str(e)
-    except Exception as e:
-        return False, str(e)
+        try:
+            response = requests.get(url, timeout=30, stream=True)
+            response.raise_for_status()
+            
+            # Ensure parent directory exists
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write file
+            with open(dest_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # Verify size
+            actual_size = dest_path.stat().st_size
+            if actual_size == 0:
+                dest_path.unlink(missing_ok=True)
+                return False, "Empty file"
+            
+            return True, actual_size
+            
+        except requests.exceptions.Timeout:
+            log_func(f"[WRN] Timeout downloading {dest_path.name}")
+        except requests.exceptions.HTTPError as e:
+            log_func(f"[WRN] HTTP {e.response.status_code} for {dest_path.name}")
+            return False, f"HTTP {e.response.status_code}"
+        except requests.exceptions.RequestException as e:
+            log_func(f"[WRN] Download error: {e}")
+        except IOError as e:
+            log_func(f"[WRN] Write error: {e}")
+            return False, str(e)
+    
+    return False, "Max retries exceeded"
 
 def auto_setup(log_func):
+    """Download and validate required files."""
     script_dir = get_script_dir()
     bin_dir = script_dir / "bin"
     bin_dir.mkdir(exist_ok=True)
     
+    # Check existing files
     all_good = True
     missing_required = []
     
-    # Check existing files
     for f in REQUIRED_FILES:
         path = build_path(f)
         if not path.exists():
@@ -194,7 +266,7 @@ def auto_setup(log_func):
                 missing_required.append(f["name"])
             all_good = False
         elif path.stat().st_size < f["min_size"]:
-            log_func(f"[WRN] {f['name']} size invalid")
+            log_func(f"[WRN] {f['name']} size invalid (expected >{format_size(f['min_size'])})")
             if f["required"]:
                 missing_required.append(f["name"])
             all_good = False
@@ -208,6 +280,7 @@ def auto_setup(log_func):
     
     downloaded = 0
     failed = 0
+    failed_names = []
     
     for f in REQUIRED_FILES:
         path = build_path(f)
@@ -226,19 +299,21 @@ def auto_setup(log_func):
                 downloaded += 1
             else:
                 path.unlink(missing_ok=True)
-                log_func(f"[ERR] {f['name']} size invalid")
+                log_func(f"[ERR] {f['name']} size invalid after download")
                 if f["required"]:
                     failed += 1
+                    failed_names.append(f["name"])
         else:
             log_func(f"[ERR] {f['name']}: {result}")
             if f["required"]:
                 failed += 1
+                failed_names.append(f["name"])
     
     log_func("[SYS] ═══ COMPLETE ═══")
     log_func(f"[SYS] Downloaded: {downloaded} | Failed: {failed}")
     
-    if missing_required or failed:
-        log_func("[ERR] Required files missing")
+    if failed_names:
+        log_func(f"[ERR] Required files missing: {', '.join(failed_names)}")
         state.setup_complete = False
         return False
     
@@ -247,29 +322,37 @@ def auto_setup(log_func):
 
 # ===== PROCESS HELPERS =====
 def is_roblox_open():
+    """Check if Roblox is running."""
     import subprocess
     try:
         result = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq RobloxPlayerBeta.exe", "/NH"],
+            ["tasklist", "/FI", "IMAGENAME eq RobloxPlayerBeta.exe", "/NH", "/FO", "CSV"],
             capture_output=True, text=True, timeout=5
         )
         state.roblox_detected = "RobloxPlayerBeta.exe" in result.stdout
         return state.roblox_detected
-    except:
+    except Exception:
         return False
 
 def get_username():
-    path = Path(os.environ.get("LOCALAPPDATA", "")) / "Roblox" / "LocalStorage" / "appStorage.json"
+    """Get Roblox username from local storage."""
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if not local_app_data:
+        return ""
+    
+    path = Path(local_app_data) / "Roblox" / "LocalStorage" / "appStorage.json"
     if not path.exists():
         return ""
+    
     try:
         import json
         data = json.loads(path.read_text(encoding="utf-8"))
         return data.get("Username", "")
-    except:
+    except Exception:
         return ""
 
 def kill_roblox(log_func):
+    """Terminate Roblox processes."""
     import subprocess
     try:
         result = subprocess.run(
@@ -293,6 +376,18 @@ class CloudyGUI:
         self.status_label = None
         self.info_label = None
         self.code_text = None
+        self.buttons = {}
+        self.boot_complete = False
+    
+    def set_buttons_state(self, enabled):
+        """Enable or disable all buttons during long operations."""
+        state_str = "normal" if enabled else "disabled"
+        for btn in self.buttons.values():
+            if btn:
+                try:
+                    btn.configure(state=state_str)
+                except:
+                    pass
     
     def build(self):
         import tkinter as tk
@@ -306,29 +401,26 @@ class CloudyGUI:
         
         # Fonts
         font_main = ("Courier New", 10)
-        font_title = ("Courier New", 11, "bold")
         
         # Colors
         green = "#00ff00"
         dim_green = "#00aa00"
         dark_green = "#004400"
         gray = "#808080"
-        red = "#660000"
         
         # Top border
         tk.Label(self.root, text="═" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
         
         # Logo
-        logo = """   _______ __   _ _______ __   _  _____  _    _ _______
-  |_____| |  | | |_____| |  | | |     |  \\  /  |_____|
-  |     | |__| | |     | |__| | |_____|   \\/   |     |
-           E X E C U T O R"""
+        logo = ("   _______ __   _ _______ __   _  _____  _    _ _______\n"
+                "  |_____| |  | | |_____| |  | | |     |  \\  /  |_____|\n"
+                "  |     | |__| | |     | |__| | |_____|   \\/   |     |\n"
+                "           E X E C U T O R")
         tk.Label(self.root, text=logo, fg=green, bg="#0a0a0a", font=font_main, justify="left").pack(pady=(5,0))
         
-        # Separator
         tk.Label(self.root, text="─" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
         
-        # Status
+        # Status section
         status_frame = tk.Frame(self.root, bg="#0a0a0a")
         status_frame.pack(fill="x", padx=10)
         tk.Label(status_frame, text="STATUS:", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x")
@@ -337,60 +429,73 @@ class CloudyGUI:
         self.info_label = tk.Label(status_frame, text="USER: --- | ROBLOX: --- | CLIENTS: 0", fg=dim_green, bg="#0a0a0a", font=font_main, anchor="w")
         self.info_label.pack(fill="x")
         
-        # Separator
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack()
         
         # Script input
         tk.Label(self.root, text="▓ SCRIPT INPUT ▓", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x", padx=10)
         
-        self.code_text = tk.Text(self.root, height=8, fg=green, bg="#0a0a0a", font=font_main, 
-                                  insertbackground=green, selectbackground="#004400", wrap="word")
+        self.code_text = tk.Text(
+            self.root, height=8, fg=green, bg="#0a0a0a", font=font_main,
+            insertbackground=green, selectbackground="#004400", wrap="word"
+        )
         self.code_text.pack(fill="x", padx=10, pady=(0,5))
-        self.code_text.insert("1.0", """print('hello from cloudy')
-game:GetService('StarterGui'):SetCore(
-  'SendNotification', {
-    Title = 'CLOUDY',
-    Text = 'working!'
-  }
-)""")
+        self.code_text.insert("1.0", "print('hello from cloudy')\n"
+                                    "game:GetService('StarterGui'):SetCore(\n"
+                                    "  'SendNotification', {\n"
+                                    "    Title = 'CLOUDY',\n"
+                                    "    Text = 'working!'\n"
+                                    "  }\n"
+                                    ")")
         
-        # Separator
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack()
         
         # Buttons row 1
         btn_frame1 = tk.Frame(self.root, bg="#0a0a0a")
         btn_frame1.pack(fill="x", padx=10, pady=(5,0))
         
-        btn_style = {"fg": "#000000", "font": font_main, "relief": "flat", "cursor": "hand2"}
+        btn_style = {"fg": "#000000", "font": font_main, "relief": "flat", "cursor": "hand2", "width": 12}
         
-        tk.Button(btn_frame1, text="[ INIT ]", bg="#00aa00", command=self.on_init, width=12, **btn_style).pack(side="left", padx=(0,5))
-        tk.Button(btn_frame1, text="[ INJECT ]", bg="#00aa00", command=self.on_inject, width=12, **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_frame1, text="[ EXEC ]", bg="#008800", command=self.on_exec, width=12, **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_frame1, text="[ CLEAR ]", bg="#006600", command=self.on_clear, width=12, **btn_style).pack(side="left", padx=5)
+        self.buttons["init"] = tk.Button(btn_frame1, text="[ INIT ]", bg="#00aa00", command=self.on_init, **btn_style)
+        self.buttons["init"].pack(side="left", padx=(0,5))
+        
+        self.buttons["inject"] = tk.Button(btn_frame1, text="[ INJECT ]", bg="#00aa00", command=self.on_inject, **btn_style)
+        self.buttons["inject"].pack(side="left", padx=5)
+        
+        self.buttons["exec"] = tk.Button(btn_frame1, text="[ EXEC ]", bg="#008800", command=self.on_exec, **btn_style)
+        self.buttons["exec"].pack(side="left", padx=5)
+        
+        self.buttons["clear"] = tk.Button(btn_frame1, text="[ CLEAR ]", bg="#006600", command=self.on_clear, **btn_style)
+        self.buttons["clear"].pack(side="left", padx=5)
         
         # Buttons row 2
         btn_frame2 = tk.Frame(self.root, bg="#0a0a0a")
         btn_frame2.pack(fill="x", padx=10, pady=(5,0))
         
-        tk.Button(btn_frame2, text="[ REINSTALL FILES ]", bg="#444400", command=self.on_reinstall, width=18, **btn_style).pack(side="left", padx=(0,5))
-        tk.Button(btn_frame2, text="[ KILL ROBLOX ]", bg="#440000", command=lambda: kill_roblox(self.log), width=16, **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_frame2, text="[ EXIT ]", bg="#333333", command=self.on_exit, width=14, **btn_style).pack(side="left", padx=5)
+        btn_style2 = {"fg": "#000000", "font": font_main, "relief": "flat", "cursor": "hand2"}
         
-        # Separator
+        self.buttons["reinstall"] = tk.Button(btn_frame2, text="[ REINSTALL FILES ]", bg="#444400", command=self.on_reinstall, width=18, **btn_style2)
+        self.buttons["reinstall"].pack(side="left", padx=(0,5))
+        
+        self.buttons["kill"] = tk.Button(btn_frame2, text="[ KILL ROBLOX ]", bg="#440000", command=lambda: kill_roblox(self.log), width=16, **btn_style2)
+        self.buttons["kill"].pack(side="left", padx=5)
+        
+        self.buttons["exit"] = tk.Button(btn_frame2, text="[ EXIT ]", bg="#333333", command=self.on_exit, width=14, **btn_style2)
+        self.buttons["exit"].pack(side="left", padx=5)
+        
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(5,0))
         
         # Console
         tk.Label(self.root, text="▓ CONSOLE OUTPUT ▓", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x", padx=10)
         
-        self.log_text = scrolledtext.ScrolledText(self.root, height=12, fg=dim_green, bg="#050505", 
-                                                    font=font_main, state="disabled", wrap="word")
+        self.log_text = scrolledtext.ScrolledText(
+            self.root, height=12, fg=dim_green, bg="#050505",
+            font=font_main, state="disabled", wrap="word"
+        )
         self.log_text.pack(fill="x", padx=10, pady=(0,5))
         
-        # Bottom border
         tk.Label(self.root, text="═" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
-        tk.Label(self.root, text="v2.0 // CLOUDY x NYX // PYTHON", fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(0,5))
+        tk.Label(self.root, text="v2.1 // CLOUDY x NYX // PYTHON", fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(0,5))
         
-        # ESC to exit
         self.root.bind("<Escape>", lambda e: self.on_exit())
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
     
@@ -399,104 +504,136 @@ game:GetService('StarterGui'):SetCore(
         line = f"[{ts}] {msg}\n"
         
         if self.log_text:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", line)
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
+            try:
+                self.log_text.configure(state="normal")
+                self.log_text.insert("end", line)
+                self.log_text.see("end")
+                self.log_text.configure(state="disabled")
+            except:
+                pass
         
         self.update_status()
     
     def update_status(self):
-        if self.status_label:
-            if state.injected:
-                self.status_label.configure(text="● INJECTED", fg="#00ff00")
-            elif state.is_registered:
-                self.status_label.configure(text="● READY", fg="#ffff00")
-            elif state.setup_complete:
-                self.status_label.configure(text="● SETUP OK", fg="#00aaff")
-            else:
-                self.status_label.configure(text="● IDLE", fg="#808080")
-        
-        if self.info_label:
-            username = get_username() or "---"
-            rbx = "YES" if state.roblox_detected else "NO"
-            clients = len(cloudy.get_clients()) if cloudy.dll else 0
-            self.info_label.configure(text=f"USER: {username} | ROBLOX: {rbx} | CLIENTS: {clients}")
+        if not self.root:
+            return
+            
+        try:
+            if self.status_label:
+                if state.injected:
+                    self.status_label.configure(text="● INJECTED", fg="#00ff00")
+                elif state.is_registered:
+                    self.status_label.configure(text="● READY", fg="#ffff00")
+                elif state.setup_complete:
+                    self.status_label.configure(text="● SETUP OK", fg="#00aaff")
+                else:
+                    self.status_label.configure(text="● IDLE", fg="#808080")
+            
+            if self.info_label:
+                username = get_username() or "---"
+                rbx = "YES" if state.roblox_detected else "NO"
+                clients = len(cloudy.get_clients()) if cloudy.dll else 0
+                self.info_label.configure(text=f"USER: {username} | ROBLOX: {rbx} | CLIENTS: {clients}")
+        except:
+            pass
     
     def on_init(self):
-        state.is_registered = True
-        state.inject_message = "CLOUDY"
-        self.log("[ OK ] Registered: CLOUDY")
-        
-        success, msg = cloudy.initialize()
-        if success:
-            self.log(f"[ OK ] {msg}")
-        else:
-            self.log(f"[ERR] {msg}")
-        self.update_status()
-    
-    def on_inject(self):
-        if not state.setup_complete:
-            self.log("[ERR] Setup incomplete - click REINSTALL")
-            return
-        
-        if not state.is_registered:
+        self.set_buttons_state(False)
+        try:
             state.is_registered = True
             state.inject_message = "CLOUDY"
-        
-        success, msg = cloudy.initialize()
-        if not success:
-            self.log(f"[ERR] {msg}")
-            return
-        
-        import time
-        time.sleep(2)
-        
-        notif = 'game:GetService("StarterGui"):SetCore("SendNotification", {Title = "CLOUDY", Text = "INJECTED"})'
-        success, msg = cloudy.execute(notif)
-        
-        if success:
-            state.injected = True
-            self.log("[SYS] Injection complete")
-        else:
-            self.log(f"[ERR] {msg}")
-        
-        self.update_status()
+            self.log("[ OK ] Registered: CLOUDY")
+            
+            success, msg = cloudy.initialize()
+            if success:
+                self.log(f"[ OK ] {msg}")
+            else:
+                self.log(f"[ERR] {msg}")
+            self.update_status()
+        finally:
+            self.set_buttons_state(True)
+    
+    def on_inject(self):
+        self.set_buttons_state(False)
+        try:
+            if not state.setup_complete:
+                self.log("[ERR] Setup incomplete - click REINSTALL")
+                return
+            
+            if not state.is_registered:
+                state.is_registered = True
+                state.inject_message = "CLOUDY"
+            
+            success, msg = cloudy.initialize()
+            if not success:
+                self.log(f"[ERR] {msg}")
+                return
+            
+            import time
+            self.log("[SYS] Waiting for DLL...")
+            time.sleep(2)
+            
+            notif = 'game:GetService("StarterGui"):SetCore("SendNotification", {Title = "CLOUDY", Text = "INJECTED"})'
+            success, msg = cloudy.execute(notif)
+            
+            if success:
+                state.injected = True
+                self.log("[SYS] Injection complete")
+            else:
+                self.log(f"[ERR] {msg}")
+            
+            self.update_status()
+        finally:
+            self.set_buttons_state(True)
     
     def on_exec(self):
-        if not state.is_registered:
-            self.log("[ERR] Not registered - click INIT first")
-            return
-        
-        script = self.code_text.get("1.0", "end").strip()
-        if not script:
-            self.log("[ERR] No script entered")
-            return
-        
-        if len(script) > 100000:
-            self.log("[ERR] Script too large")
-            return
-        
-        success, msg = cloudy.execute(script)
-        if success:
-            self.log(f"[ OK ] {msg}")
-        else:
-            self.log(f"[ERR] {msg}")
+        self.set_buttons_state(False)
+        try:
+            if not state.is_registered:
+                self.log("[ERR] Not registered - click INIT first")
+                return
+            
+            script = self.code_text.get("1.0", "end").strip()
+            if not script:
+                self.log("[ERR] No script entered")
+                return
+            
+            if len(script) > 100000:
+                self.log("[ERR] Script too large")
+                return
+            
+            success, msg = cloudy.execute(script)
+            if success:
+                self.log(f"[ OK ] {msg}")
+            else:
+                self.log(f"[ERR] {msg}")
+        finally:
+            self.set_buttons_state(True)
     
     def on_clear(self):
         if self.log_text:
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", "end")
-            self.log_text.configure(state="disabled")
+            try:
+                self.log_text.configure(state="normal")
+                self.log_text.delete("1.0", "end")
+                self.log_text.configure(state="disabled")
+            except:
+                pass
     
     def on_reinstall(self):
-        state.setup_complete = False
-        auto_setup(self.log)
-        self.update_status()
+        self.set_buttons_state(False)
+        try:
+            state.setup_complete = False
+            auto_setup(self.log)
+            self.update_status()
+        finally:
+            self.set_buttons_state(True)
     
     def on_exit(self):
         if self.root:
-            self.root.destroy()
+            try:
+                self.root.destroy()
+            except:
+                pass
         sys.exit()
     
     def run(self):
@@ -506,18 +643,14 @@ game:GetService('StarterGui'):SetCore(
 # ===== BOOT SEQUENCE =====
 def boot_sequence(log_func):
     import time
-    log_func("[SYS] CLOUDY TERMINAL v2.0 (Python)")
-    time.sleep(0.1)
+    log_func("[SYS] CLOUDY TERMINAL v2.1 (Python)")
     log_func("[SYS] INITIALIZING...")
-    time.sleep(0.1)
     log_func("[SYS] Loading modules...")
-    time.sleep(0.1)
     log_func("[SYS] ┌─────────────────┐")
     log_func("[SYS] │ cloudcore.dll   │ LOADED")
     log_func("[SYS] │ luau_bridge.dll │ LOADED")
     log_func("[SYS] │ net_handler.dll │ LOADED")
     log_func("[SYS] └─────────────────┘")
-    time.sleep(0.1)
     
     if is_roblox_open():
         log_func("[SYS] ROBLOX: DETECTED")
@@ -531,23 +664,17 @@ def boot_sequence(log_func):
 
 # ===== MAIN =====
 def main():
-    # Check for requests
-    try:
-        import requests
-    except ImportError:
-        print("Installing requests...")
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    
     gui = CloudyGUI()
     
-    # Boot in thread so GUI shows immediately
-    def boot():
-        auto_setup(gui.log)
-        boot_sequence(gui.log)
+    def boot_thread():
+        try:
+            auto_setup(gui.log)
+            boot_sequence(gui.log)
+            gui.boot_complete = True
+        except Exception as e:
+            gui.log(f"[ERR] Boot failed: {e}")
     
-    threading.Thread(target=boot, daemon=True).start()
-    
+    threading.Thread(target=boot_thread, daemon=True).start()
     gui.run()
 
 if __name__ == "__main__":
