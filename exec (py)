@@ -42,6 +42,7 @@ class State:
     injected = False
     setup_complete = False
     roblox_detected = False
+    dll_loaded = False
 
 state = State()
 
@@ -71,35 +72,47 @@ def build_path(file_info):
 class CloudyDLL:
     def __init__(self):
         self.dll = None
+        self.uses_stdcall = False
         self.ptr_size = struct.calcsize("P")
     
     def load(self):
+        """Load the DLL and set up function signatures."""
         dll_path = get_dll_path()
         if not dll_path.exists():
             return False, "Cloudy.dll not found"
+        
+        # Try cdecl first
         try:
             self.dll = ctypes.CDLL(str(dll_path))
-            
-            # Set up function signatures
-            self.dll.Initialize.restype = ctypes.c_int
-            self.dll.Initialize.argtypes = []
-            
-            self.dll.GetClients.restype = ctypes.c_void_p
-            self.dll.GetClients.argtypes = []
-            
-            # ExecuteAsync: void ExecuteAsync(byte* script, char** clients, int numClients)
-            self.dll.ExecuteAsync.restype = ctypes.c_int
-            self.dll.ExecuteAsync.argtypes = [
-                ctypes.c_char_p,
-                ctypes.POINTER(ctypes.c_char_p),
-                ctypes.c_int
-            ]
-            
-            return True, "Loaded"
-        except OSError as e:
-            return False, f"Load failed: {e}"
+            self._setup_signatures()
+            return True, "Loaded (cdecl)"
         except Exception as e:
-            return False, str(e)
+            pass
+        
+        # Try stdcall if cdecl fails
+        try:
+            self.dll = ctypes.WinDLL(str(dll_path))
+            self.uses_stdcall = True
+            self._setup_signatures()
+            return True, "Loaded (stdcall)"
+        except Exception as e:
+            self.dll = None
+            return False, f"Load failed: {e}"
+    
+    def _setup_signatures(self):
+        """Set up function signatures for the loaded DLL."""
+        self.dll.Initialize.restype = ctypes.c_int
+        self.dll.Initialize.argtypes = []
+        
+        self.dll.GetClients.restype = ctypes.c_void_p
+        self.dll.GetClients.argtypes = []
+        
+        self.dll.ExecuteAsync.restype = ctypes.c_int
+        self.dll.ExecuteAsync.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_int
+        ]
     
     def initialize(self):
         if not self.dll:
@@ -113,7 +126,6 @@ class CloudyDLL:
             return False, str(e)
     
     def get_clients(self):
-        """Safely read client list from DLL."""
         if not self.dll:
             return []
         
@@ -123,41 +135,30 @@ class CloudyDLL:
             if not raw_ptr:
                 return clients
             
-            # Calculate struct size: char* version, char* name, int id
-            # With proper alignment for 64-bit
             struct_size = self.ptr_size * 2 + 4
-            # Align to pointer boundary
             if struct_size % self.ptr_size != 0:
                 struct_size += self.ptr_size - (struct_size % self.ptr_size)
-            
-            # Create a pointer type for iteration
-            byte_ptr = ctypes.c_char * (struct_size * 50)
             
             for i in range(50):
                 offset = i * struct_size
                 
                 try:
-                    # Read name pointer safely
                     name_ptr_addr = raw_ptr + offset + self.ptr_size
                     name_ptr = ctypes.c_char_p.from_address(name_ptr_addr).value
                     
                     if not name_ptr:
                         break
                     
-                    # Read version pointer safely
                     version_ptr_addr = raw_ptr + offset
                     version_ptr = ctypes.c_char_p.from_address(version_ptr_addr).value
                     
-                    # Read id
                     id_addr = raw_ptr + offset + self.ptr_size * 2
                     id_bytes = (ctypes.c_ubyte * 4).from_address(id_addr)
                     id_val = struct.unpack("i", bytes(id_bytes))[0]
                     
-                    # Decode strings safely
                     name = name_ptr.decode("utf-8", errors="replace") if name_ptr else ""
                     version = version_ptr.decode("utf-8", errors="replace") if version_ptr else ""
                     
-                    # Validate name length
                     if 0 < len(name) < 100:
                         clients.append({
                             "name": name,
@@ -165,7 +166,6 @@ class CloudyDLL:
                             "id": id_val
                         })
                 except (OSError, ValueError):
-                    # Stop if we can't read (invalid memory)
                     break
                     
         except Exception as e:
@@ -181,20 +181,15 @@ class CloudyDLL:
         if not clients:
             return False, "No clients connected"
         
-        # Encode script to bytes
         script_bytes = script.encode("utf-8")
-        
-        # Build client names array
         num_clients = len(clients)
         
-        # Create the array type
         CharPtrArray = ctypes.c_char_p * num_clients
         names_array = CharPtrArray()
         
         for i, c in enumerate(clients):
             names_array[i] = c["name"].encode("utf-8")
         
-        # Cast to proper pointer type for the function
         names_ptr = ctypes.cast(names_array, ctypes.POINTER(ctypes.c_char_p))
         
         try:
@@ -204,12 +199,14 @@ class CloudyDLL:
             return True, "Executed"
         except Exception as e:
             return False, str(e)
+    
+    def is_loaded(self):
+        return self.dll is not None
 
 cloudy = CloudyDLL()
 
 # ===== DOWNLOAD / SETUP =====
 def download_file(url, dest_path, log_func, retries=1):
-    """Download a file with retry logic."""
     dest_path = Path(dest_path)
     
     for attempt in range(1, retries + 1):
@@ -220,15 +217,12 @@ def download_file(url, dest_path, log_func, retries=1):
             response = requests.get(url, timeout=30, stream=True)
             response.raise_for_status()
             
-            # Ensure parent directory exists
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Write file
             with open(dest_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
             
-            # Verify size
             actual_size = dest_path.stat().st_size
             if actual_size == 0:
                 dest_path.unlink(missing_ok=True)
@@ -237,9 +231,9 @@ def download_file(url, dest_path, log_func, retries=1):
             return True, actual_size
             
         except requests.exceptions.Timeout:
-            log_func(f"[WRN] Timeout downloading {dest_path.name}")
+            log_func(f"[WRN] Timeout: {dest_path.name}")
         except requests.exceptions.HTTPError as e:
-            log_func(f"[WRN] HTTP {e.response.status_code} for {dest_path.name}")
+            log_func(f"[WRN] HTTP {e.response.status_code}: {dest_path.name}")
             return False, f"HTTP {e.response.status_code}"
         except requests.exceptions.RequestException as e:
             log_func(f"[WRN] Download error: {e}")
@@ -250,12 +244,10 @@ def download_file(url, dest_path, log_func, retries=1):
     return False, "Max retries exceeded"
 
 def auto_setup(log_func):
-    """Download and validate required files."""
     script_dir = get_script_dir()
     bin_dir = script_dir / "bin"
     bin_dir.mkdir(exist_ok=True)
     
-    # Check existing files
     all_good = True
     missing_required = []
     
@@ -266,7 +258,7 @@ def auto_setup(log_func):
                 missing_required.append(f["name"])
             all_good = False
         elif path.stat().st_size < f["min_size"]:
-            log_func(f"[WRN] {f['name']} size invalid (expected >{format_size(f['min_size'])})")
+            log_func(f"[WRN] {f['name']} size invalid")
             if f["required"]:
                 missing_required.append(f["name"])
             all_good = False
@@ -285,7 +277,6 @@ def auto_setup(log_func):
     for f in REQUIRED_FILES:
         path = build_path(f)
         
-        # Skip if valid
         if path.exists() and path.stat().st_size >= f["min_size"]:
             continue
         
@@ -322,7 +313,6 @@ def auto_setup(log_func):
 
 # ===== PROCESS HELPERS =====
 def is_roblox_open():
-    """Check if Roblox is running."""
     import subprocess
     try:
         result = subprocess.run(
@@ -335,7 +325,6 @@ def is_roblox_open():
         return False
 
 def get_username():
-    """Get Roblox username from local storage."""
     local_app_data = os.environ.get("LOCALAPPDATA", "")
     if not local_app_data:
         return ""
@@ -352,7 +341,6 @@ def get_username():
         return ""
 
 def kill_roblox(log_func):
-    """Terminate Roblox processes."""
     import subprocess
     try:
         result = subprocess.run(
@@ -377,10 +365,8 @@ class CloudyGUI:
         self.info_label = None
         self.code_text = None
         self.buttons = {}
-        self.boot_complete = False
     
     def set_buttons_state(self, enabled):
-        """Enable or disable all buttons during long operations."""
         state_str = "normal" if enabled else "disabled"
         for btn in self.buttons.values():
             if btn:
@@ -399,19 +385,14 @@ class CloudyGUI:
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         
-        # Fonts
         font_main = ("Courier New", 10)
-        
-        # Colors
         green = "#00ff00"
         dim_green = "#00aa00"
         dark_green = "#004400"
         gray = "#808080"
         
-        # Top border
         tk.Label(self.root, text="═" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
         
-        # Logo
         logo = ("   _______ __   _ _______ __   _  _____  _    _ _______\n"
                 "  |_____| |  | | |_____| |  | | |     |  \\  /  |_____|\n"
                 "  |     | |__| | |     | |__| | |_____|   \\/   |     |\n"
@@ -420,7 +401,6 @@ class CloudyGUI:
         
         tk.Label(self.root, text="─" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
         
-        # Status section
         status_frame = tk.Frame(self.root, bg="#0a0a0a")
         status_frame.pack(fill="x", padx=10)
         tk.Label(status_frame, text="STATUS:", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x")
@@ -431,7 +411,6 @@ class CloudyGUI:
         
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack()
         
-        # Script input
         tk.Label(self.root, text="▓ SCRIPT INPUT ▓", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x", padx=10)
         
         self.code_text = tk.Text(
@@ -449,7 +428,6 @@ class CloudyGUI:
         
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack()
         
-        # Buttons row 1
         btn_frame1 = tk.Frame(self.root, bg="#0a0a0a")
         btn_frame1.pack(fill="x", padx=10, pady=(5,0))
         
@@ -467,7 +445,6 @@ class CloudyGUI:
         self.buttons["clear"] = tk.Button(btn_frame1, text="[ CLEAR ]", bg="#006600", command=self.on_clear, **btn_style)
         self.buttons["clear"].pack(side="left", padx=5)
         
-        # Buttons row 2
         btn_frame2 = tk.Frame(self.root, bg="#0a0a0a")
         btn_frame2.pack(fill="x", padx=10, pady=(5,0))
         
@@ -484,7 +461,6 @@ class CloudyGUI:
         
         tk.Label(self.root, text="─" * 65, fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(5,0))
         
-        # Console
         tk.Label(self.root, text="▓ CONSOLE OUTPUT ▓", fg=green, bg="#0a0a0a", font=font_main, anchor="w").pack(fill="x", padx=10)
         
         self.log_text = scrolledtext.ScrolledText(
@@ -494,7 +470,7 @@ class CloudyGUI:
         self.log_text.pack(fill="x", padx=10, pady=(0,5))
         
         tk.Label(self.root, text="═" * 65, fg=green, bg="#0a0a0a", font=font_main).pack()
-        tk.Label(self.root, text="v2.1 // CLOUDY x NYX // PYTHON", fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(0,5))
+        tk.Label(self.root, text="v2.2 // CLOUDY x NYX // PYTHON", fg=dark_green, bg="#0a0a0a", font=font_main).pack(pady=(0,5))
         
         self.root.bind("<Escape>", lambda e: self.on_exit())
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -522,6 +498,8 @@ class CloudyGUI:
             if self.status_label:
                 if state.injected:
                     self.status_label.configure(text="● INJECTED", fg="#00ff00")
+                elif state.dll_loaded:
+                    self.status_label.configure(text="● DLL LOADED", fg="#00aaff")
                 elif state.is_registered:
                     self.status_label.configure(text="● READY", fg="#ffff00")
                 elif state.setup_complete:
@@ -532,14 +510,33 @@ class CloudyGUI:
             if self.info_label:
                 username = get_username() or "---"
                 rbx = "YES" if state.roblox_detected else "NO"
-                clients = len(cloudy.get_clients()) if cloudy.dll else 0
-                self.info_label.configure(text=f"USER: {username} | ROBLOX: {rbx} | CLIENTS: {clients}")
+                clients = len(cloudy.get_clients()) if cloudy.is_loaded() else 0
+                dll_status = "LOADED" if state.dll_loaded else "NOT LOADED"
+                self.info_label.configure(text=f"USER: {username} | ROBLOX: {rbx} | DLL: {dll_status} | CLIENTS: {clients}")
         except:
             pass
+    
+    def ensure_dll_loaded(self):
+        """Load DLL if not already loaded. Returns (success, message)."""
+        if cloudy.is_loaded():
+            return True, "Already loaded"
+        
+        success, msg = cloudy.load()
+        if success:
+            state.dll_loaded = True
+            self.log(f"[ OK ] DLL {msg}")
+        else:
+            self.log(f"[ERR] DLL {msg}")
+        return success, msg
     
     def on_init(self):
         self.set_buttons_state(False)
         try:
+            # Load DLL first
+            success, msg = self.ensure_dll_loaded()
+            if not success:
+                return
+            
             state.is_registered = True
             state.inject_message = "CLOUDY"
             self.log("[ OK ] Registered: CLOUDY")
@@ -549,6 +546,7 @@ class CloudyGUI:
                 self.log(f"[ OK ] {msg}")
             else:
                 self.log(f"[ERR] {msg}")
+            
             self.update_status()
         finally:
             self.set_buttons_state(True)
@@ -556,6 +554,11 @@ class CloudyGUI:
     def on_inject(self):
         self.set_buttons_state(False)
         try:
+            # Ensure DLL is loaded
+            success, msg = self.ensure_dll_loaded()
+            if not success:
+                return
+            
             if not state.setup_complete:
                 self.log("[ERR] Setup incomplete - click REINSTALL")
                 return
@@ -593,6 +596,11 @@ class CloudyGUI:
                 self.log("[ERR] Not registered - click INIT first")
                 return
             
+            # Ensure DLL is loaded
+            if not cloudy.is_loaded():
+                self.log("[ERR] DLL not loaded - click INIT first")
+                return
+            
             script = self.code_text.get("1.0", "end").strip()
             if not script:
                 self.log("[ERR] No script entered")
@@ -622,6 +630,15 @@ class CloudyGUI:
     def on_reinstall(self):
         self.set_buttons_state(False)
         try:
+            # Unload DLL before reinstalling
+            if cloudy.dll:
+                try:
+                    ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(cloudy.dll._handle))
+                except:
+                    pass
+                cloudy.dll = None
+                state.dll_loaded = False
+            
             state.setup_complete = False
             auto_setup(self.log)
             self.update_status()
@@ -642,8 +659,7 @@ class CloudyGUI:
 
 # ===== BOOT SEQUENCE =====
 def boot_sequence(log_func):
-    import time
-    log_func("[SYS] CLOUDY TERMINAL v2.1 (Python)")
+    log_func("[SYS] CLOUDY TERMINAL v2.2 (Python)")
     log_func("[SYS] INITIALIZING...")
     log_func("[SYS] Loading modules...")
     log_func("[SYS] ┌─────────────────┐")
@@ -659,7 +675,7 @@ def boot_sequence(log_func):
         log_func("[SYS] Launch Roblox before injecting")
     
     log_func("[SYS] ══════════════════════════")
-    log_func("[SYS] READY")
+    log_func("[SYS] READY - Click INIT to load DLL")
     log_func("[SYS] ══════════════════════════")
 
 # ===== MAIN =====
@@ -670,7 +686,6 @@ def main():
         try:
             auto_setup(gui.log)
             boot_sequence(gui.log)
-            gui.boot_complete = True
         except Exception as e:
             gui.log(f"[ERR] Boot failed: {e}")
     
