@@ -6,7 +6,6 @@ global isRegistered := false
 global injectMessage := ""
 global consoleLines := []
 global gui := 0
-global useExternal := true
 global injected := false
 global animPhase := 0
 
@@ -25,10 +24,10 @@ AutoSetup() {
     ]
     
     local baseUrl := "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/"
-    
     local needsDownload := false
+    
     for f in files {
-        local path := (f.dir ? A_ScriptDir . "\\" . f.dir . "\\" : A_ScriptDir . "\\") . f.name
+        local path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
         if !FileExist(path) {
             needsDownload := true
             break
@@ -46,21 +45,19 @@ AutoSetup() {
         DirCreate(binPath)
     
     for f in files {
-        local path := (f.dir ? A_ScriptDir . "\\" . f.dir . "\\" : A_ScriptDir . "\\") . f.name
+        local path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
         if FileExist(path)
             continue
+        
         Log("[DL ] " . f.name)
+        local tmp := path . ".tmp"
+        
         try {
-            ; Download to temp file first
-            local tmp := path . ".tmp"
             UrlDownloadToFile(baseUrl . f.name, tmp)
+            
             if FileExist(tmp) {
                 local size := FileGetSize(tmp)
                 if (size > 0) {
-                    ; ensure parent dir exists
-                    parent := RegExReplace(path, "\\[^\\]+$", "")
-                    if parent && !DirExist(parent)
-                        DirCreate(parent)
                     FileMove(tmp, path, 1)
                     Log("[ OK ] " . f.name)
                 } else {
@@ -76,20 +73,20 @@ AutoSetup() {
             Log("[ERR] " . f.name . " - " . e.Message)
         }
     }
+    
     Log("[SYS] ═══ COMPLETE ═══")
 }
 
 ; ===== DLL CALLS =====
 
 Initialize() {
-    global DLL_PATH
     if !FileExist(DLL_PATH) {
         Log("[ERR] Cloudy.dll missing")
         return false
     }
     try {
-        local result := DllCall(DLL_PATH "\Initialize", "Int", "Cdecl")
-        Log("[OK ] Initialized (return: " . result . ")")
+        local result := DllCall(DLL_PATH "\Initialize", "Int", "CDecl")
+        Log("[ OK ] Initialized")
         return true
     } catch as e {
         Log("[ERR] " . e.Message)
@@ -98,25 +95,25 @@ Initialize() {
 }
 
 ExecuteScript(script) {
-    global isRegistered, injected, DLL_PATH
     if !isRegistered {
         Log("[ERR] Not registered")
         return false
     }
+    
     local clients := GetClients()
     if !clients.Length {
         Log("[ERR] No clients")
         return false
     }
     
-    ; Safe buffer allocation (include NUL)
     local scriptSize := StrPut(script, "UTF-8")
     local scriptBytes := Buffer(scriptSize)
     StrPut(script, scriptBytes, "UTF-8")
 
     local numClients := clients.Length
     local ptrArray := Buffer(numClients * A_PtrSize)
-    local strings := [] ; keep buffers alive
+    local strings := []
+    
     for i, c in clients {
         local nameSize := StrPut(c.name, "UTF-8")
         local buf := Buffer(nameSize)
@@ -124,10 +121,10 @@ ExecuteScript(script) {
         strings.Push(buf)
         NumPut(buf.Ptr, ptrArray, (i - 1) * A_PtrSize, "Ptr")
     }
+    
     try {
-        local result := DllCall(DLL_PATH "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients, "Cdecl")
-        Log("[OK ] Script executed (return: " . result . ")")
-        injected := true
+        DllCall(DLL_PATH "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients, "CDecl")
+        Log("[ OK ] Script executed")
         return true
     } catch as e {
         Log("[ERR] " . e.Message)
@@ -136,18 +133,19 @@ ExecuteScript(script) {
 }
 
 GetClients() {
-    global DLL_PATH
     local clients := []
     if !FileExist(DLL_PATH)
         return clients
     try {
-        local ptr := DllCall(DLL_PATH "\GetClients", "Ptr", "Cdecl")
+        local ptr := DllCall(DLL_PATH "\GetClients", "Ptr", "CDecl")
         if !ptr
             return clients
-        ; calculate struct size (versionPtr, namePtr, int id, padding)
-        local structSize := 24
-        local maxClients := 50
-        loop maxClients {
+        
+        local structSize := (A_PtrSize * 2) + 4
+        if (Mod(structSize, A_PtrSize) != 0)
+            structSize += (A_PtrSize - Mod(structSize, A_PtrSize))
+        
+        loop 50 {
             local offset := (A_Index - 1) * structSize
             local namePtr := NumGet(ptr, offset + A_PtrSize, "Ptr")
             if !namePtr
@@ -159,13 +157,12 @@ GetClients() {
             clients.Push({name: name, version: version, id: id})
         }
     } catch as e {
-        Log("[WRN] GetClients error: " . e.Message)
+        Log("[WRN] GetClients: " . e.Message)
     }
     return clients
 }
 
 Inject() {
-    global isRegistered
     if !isRegistered
         Register("CLOUDY")
     if !Initialize()
@@ -179,50 +176,34 @@ Inject() {
 }
 
 Register(msg) {
-    global injectMessage, isRegistered
     injectMessage := msg
     isRegistered := true
-    Log("[OK ] Registered: " . msg)
+    Log("[ OK ] Registered: " . msg)
 }
 
 IsRobloxOpen() {
     try {
         for p in ComObjGet("winmgmts:").ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
             return true
-    } catch
+    }
     return false
 }
 
 GetUsername() {
-    ; Use local AppData to be more robust
     local path := A_LocalAppData . "\Roblox\LocalStorage\appStorage.json"
     if !FileExist(path)
         return ""
     try {
         local content := FileRead(path, "UTF-8")
-        if RegExMatch(content, """Username""" . "\s*:\s*""""([^"]+)"""", &m)
+        if RegExMatch(content, """Username""\s*:\s*""([^""]+)""", &m)
             return m[1]
-    } catch
+    }
     return ""
-}
-
-; ===== ASCII ART =====
-
-GetLogo() {
-    return "\n    (\n    ███╗   ██╗███████╗ ██████╗ ███╗   ██╗\n    ████╗  ██║██╔════╝██╔═══██╗████╗  ██║\n    ██╔██╗ ██║█████╗  ██║   ██║██╔██╗ ██║\n    ██║╚██╗██║██╔══╝  ██║   ██║██║╚██╗██║\n    ██║ ╚████║███████╗╚██████╔╝██║ ╚████║\n    ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝\n           E X E C U T O R\n    )"
-}
-
-GetScanline() {
-    local lines := []
-    loop 40
-        lines.Push("─")
-    return lines.Join("")
 }
 
 ; ===== LOGGING =====
 
 Log(msg) {
-    global consoleLines, gui
     local ts := Format("{:02d}:{:02d}:{:02d}", A_Hour, A_Min, A_Sec)
     local line := "[" . ts . "] " . msg
     consoleLines.Push(line)
@@ -236,16 +217,12 @@ Log(msg) {
             gui["_Console"].Value := out
             local len := StrLen(out)
             gui["_Console"].EditSelStart := (len > 0 ? len - 1 : 0)
-        } catch
-        {
-            ; ignore gui write errors
         }
     }
     UpdateStatus()
 }
 
 UpdateStatus() {
-    global gui, injected, isRegistered
     if !gui
         return
     local status := "IDLE"
@@ -260,10 +237,15 @@ UpdateStatus() {
     try {
         gui["_Status"].Value := "● " . status
         gui["_Status"].Opt(color)
-    } catch
-    {
-        ; ignore
     }
+}
+
+UpdateInfo() {
+    if !gui
+        return
+    local username := GetUsername()
+    local clients := GetClients()
+    gui["_Info"].Value := "USER: " . (username ? username : "---") . " | CLIENTS: " . clients.Length
 }
 
 ; ===== CRT EFFECT =====
@@ -273,95 +255,59 @@ StartCRTEffect() {
 }
 
 CRTFlash() {
-    global animPhase, gui
     animPhase++
     if !gui
         return
     try {
-        if (Mod(animPhase, 10) = 0) {
+        if (Mod(animPhase, 10) = 0)
             gui.Opt("+Border " . (Mod(animPhase, 20) = 0 ? "0x003300" : "0x002200"))
-        }
-    } catch
-    {
     }
 }
 
 ; ===== GUI =====
 
 BuildGUI() {
-    global gui
     gui := Gui("+AlwaysOnTop -DPIScale +ToolWindow")
     gui.BackColor := "0a0a0a"
     gui.SetFont("s11", "Courier New")
     
-    ; Top border effect
     gui.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    
-    ; Logo
-    gui.Add("Text", "w520 h100 c00ff00 Center", GetLogo())
-    
-    ; Separator
+    gui.Add("Text", "w520 h90 c00ff00 Center", "   _______ __   _ _______ __   _  _____  _    _ _______`n  |_____| |  | | |_____| |  | | |     |  \  /  |_____|`n  |     | |__| | |     | |__| | |_____|   \/   |     |`n           E X E C U T O R")
     gui.Add("Text", "w520 h2 c00ff00", "─────────────────────────────────────────────────────")
     
-    ; Status
     gui.Add("Text", "w520 h20 c00ff00", "STATUS:")
     gui.Add("Text", "w520 h25 v_Status c808080", "● IDLE")
-    
-    ; Info line
     gui.Add("Text", "w520 h18 v_Info c00aa00", "USER: --- | CLIENTS: 0")
     
-    ; Separator
     gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
-    
-    ; Script editor label
     gui.Add("Text", "w520 h18 c00ff00", "▓ SCRIPT INPUT ▓")
+    gui.Add("Edit", "w520 h140 v_Code -Wrap c00ff00 Background0a0a0a", "print('hello from cloudy')`ngame:GetService('StarterGui'):SetCore(`n  'SendNotification', {`n    Title = 'CLOUDY',`n    Text = 'working!'`n  }`n)")
     
-    ; Script editor
-    gui.Add("Edit", "w520 h140 v_Code -Wrap c00ff00 Background0a0a0a", "\nprint('hello from cloudy')\ngame:GetService('StarterGui'):SetCore(\n  'SendNotification', {\n    Title = 'CLOUDY',\n    Text = 'working!'\n  }\n)")
-    
-    ; Separator
     gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
     
-    ; Buttons row 1
     gui.Add("Button", "w120 h28 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => (Register("CLOUDY"), Initialize(), UpdateInfo()))
     gui.Add("Button", "x+8 w120 h28 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => (Inject(), UpdateInfo()))
     gui.Add("Button", "x+8 w120 h28 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => ExecuteScript(gui["_Code"].Value))
     gui.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (consoleLines := [], gui["_Console"].Value := ""))
     
-    ; Buttons row 2
     gui.Add("Button", "w184 h28 c000000 Background444400 y+4", "[ REINSTALL FILES ]").OnEvent("Click", (*) => AutoSetup())
     gui.Add("Button", "x+8 w160 h28 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
     gui.Add("Button", "x+8 w148 h28 c000000 Background333333", "[ EXIT ]").OnEvent("Click", (*) => QuitApp())
     
-    ; Separator
     gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
-    
-    ; Console label
     gui.Add("Text", "w520 h18 c00ff00", "▓ CONSOLE OUTPUT ▓")
-    
-    ; Console
     gui.Add("Edit", "w520 h150 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
     
-    ; Bottom border
     gui.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    
-    ; Footer
-    gui.Add("Text", "w520 h16 c004400 Center", "v1.0 // CLOUDY x NYX // PRESS [ESC] TO EXIT")
+    gui.Add("Text", "w520 h16 c004400 Center", "v1.0 // CLOUDY x NYX // [ESC] EXIT")
     
     gui.Show("w540 h720", "CLOUDY // TERMINAL")
-    
-    ; ESC to exit
     HotKey("Escape", (*) => QuitApp())
 }
 
 QuitApp() {
-    global gui
-    try {
-        if gui
-            gui.Destroy()
-    } catch
-    {
-    }
+    if gui
+        gui.Destroy()
     ExitApp()
 }
 
@@ -371,20 +317,9 @@ KillRoblox() {
             try
                 p.Terminate()
         }
-    } catch
-    {
     }
     Log("[SYS] Roblox terminated")
     injected := false
-}
-
-UpdateInfo() {
-    global gui
-    if !gui
-        return
-    local username := GetUsername()
-    local clients := GetClients()
-    gui["_Info"].Value := "USER: " . (username ? username : "---") . " | CLIENTS: " . clients.Length
 }
 
 ; ===== BOOT SEQUENCE =====
@@ -405,9 +340,9 @@ BootSequence() {
     Sleep(200)
     
     if IsRobloxOpen() {
-        Log("[SYS] ROBLOX PROCESS: DETECTED")
+        Log("[SYS] ROBLOX: DETECTED")
     } else {
-        Log("[SYS] ROBLOX PROCESS: NOT FOUND")
+        Log("[SYS] ROBLOX: NOT FOUND")
         Log("[SYS] Launch Roblox before injecting")
     }
     
