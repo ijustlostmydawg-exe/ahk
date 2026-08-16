@@ -1,177 +1,478 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-global DLL_PATH := A_ScriptDir . "\bin\Cloudy.dll"
-global isRegistered := false
-global injectMessage := ""
-global consoleLines := []
-global gui := 0
-global injected := false
-global animPhase := 0
+; ===== CONFIGURATION =====
+global CONFIG := {
+    dllPath: A_ScriptDir . "\bin\Cloudy.dll",
+    baseUrl: "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/",
+    maxLogLines: 200,
+    maxScriptSize: 100000,
+    largeScriptThreshold: 10000,
+    downloadTimeout: 30000,
+    maxRetries: 3,
+    retryDelay: 1500
+}
 
-; ===== AUTO-SETUP =====
+global REQUIRED_FILES := [
+    {name: "Cloudy.dll", dir: "bin", required: true, minSize: 10000},
+    {name: "libcrypto-3-x64.dll", dir: "bin", required: true, minSize: 1000000},
+    {name: "libssl-3-x64.dll", dir: "bin", required: true, minSize: 500000},
+    {name: "xxhash.dll", dir: "bin", required: true, minSize: 10000},
+    {name: "zstd.dll", dir: "bin", required: true, minSize: 100000},
+    {name: "Injector.exe", dir: "", required: false, minSize: 50000},
+    {name: "Module.dll", dir: "", required: false, minSize: 50000},
+    {name: "fmt.dll", dir: "", required: false, minSize: 50000}
+]
 
-AutoSetup() {
-    local files := [
-        {name: "Cloudy.dll", dir: "bin"},
-        {name: "libcrypto-3-x64.dll", dir: "bin"},
-        {name: "libssl-3-x64.dll", dir: "bin"},
-        {name: "xxhash.dll", dir: "bin"},
-        {name: "zstd.dll", dir: "bin"},
-        {name: "Injector.exe", dir: ""},
-        {name: "Module.dll", dir: ""},
-        {name: "fmt.dll", dir: ""}
-    ]
-    
-    local baseUrl := "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/"
-    local needsDownload := false
-    
-    for f in files {
-        local path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
-        if !FileExist(path) {
-            needsDownload := true
-            break
-        }
+; ===== STATE =====
+global STATE := {
+    isRegistered: false,
+    injectMessage: "",
+    injected: false,
+    gui: 0,
+    animPhase: 0,
+    consoleLines: [],
+    lastError: "",
+    setupComplete: false,
+    robloxDetected: false
+}
+
+; ===== SAFETY CHECKS =====
+
+ValidateEnvironment() {
+    ; Check AHK version
+    local v := A_AhkVersion
+    local parts := StrSplit(v, ".")
+    if (parts[1] < 2) {
+        ShowFatalError("AHK v2.0+ required. You have v" . v)
+        return false
     }
     
-    if !needsDownload {
-        Log("[SYS] All files present")
+    ; Check if running as script (not compiled without files)
+    if (A_IsCompiled && !FileExist(A_ScriptDir . "\bin")) {
+        ShowFatalError("Compiled script detected but bin folder missing.`nExtract files properly.")
+        return false
+    }
+    
+    ; Check internet connectivity (basic)
+    try {
+        DllCall("wininet.dll\InternetGetConnectedState", "UIntP", 0, "UInt", 0)
+    } catch {
+        Log("[WRN] Cannot verify internet connectivity")
+    }
+    
+    return true
+}
+
+ShowFatalError(msg) {
+    MsgBox(msg, "CLOUDY - Fatal Error", "16 IconX")
+    ExitApp()
+}
+
+SafeFileExists(path) {
+    try {
+        return FileExist(path) ? true : false
+    }
+    return false
+}
+
+SafeFileSize(path) {
+    try {
+        if !FileExist(path)
+            return 0
+        return FileGetSize(path)
+    }
+    return 0
+}
+
+IsFileInUse(filePath) {
+    try {
+        local handle := DllCall("kernel32.dll\CreateFileW", 
+            "Str", filePath,
+            "UInt", 0x80000000,
+            "UInt", 0,
+            "Ptr", 0,
+            "UInt", 3,
+            "UInt", 0x80,
+            "Ptr", 0, "Ptr")
+        
+        if (handle = -1 || handle = 0xFFFFFFFF)
+            return true
+        
+        DllCall("kernel32.dll\CloseHandle", "Ptr", handle)
+        return false
+    } catch {
         return true
     }
-    
-    Log("[SYS] ═══ DOWNLOADING ═══")
+}
+
+ValidateFileSize(path, minSize) {
+    local size := SafeFileSize(path)
+    return (size >= minSize)
+}
+
+; ===== AUTO-SETUP WITH VALIDATION =====
+
+AutoSetup() {
     local binPath := A_ScriptDir . "\bin"
     if !DirExist(binPath)
         DirCreate(binPath)
     
-    for f in files {
-        local path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
-        if FileExist(path)
+    local allGood := true
+    local missingRequired := []
+    local invalidRequired := []
+    
+    ; Phase 1: Check what's missing or invalid
+    for f in REQUIRED_FILES {
+        local path := BuildPath(f)
+        
+        if !SafeFileExists(path) {
+            if f.required
+                missingRequired.Push(f.name)
+            allGood := false
+            continue
+        }
+        
+        ; Validate file size
+        if !ValidateFileSize(path, f.minSize) {
+            Log("[WRN] " . f.name . " size invalid (expected >" . FormatFileSize(f.minSize) . ")")
+            if f.required
+                invalidRequired.Push(f.name)
+            allGood := false
+        }
+    }
+    
+    if allGood {
+        STATE.setupComplete := true
+        Log("[SYS] All files validated")
+        return true
+    }
+    
+    Log("[SYS] ═══ DOWNLOADING ═══")
+    
+    local downloaded := 0
+    local failed := 0
+    
+    for f in REQUIRED_FILES {
+        local path := BuildPath(f)
+        local needsDownload := false
+        
+        if !SafeFileExists(path) {
+            needsDownload := true
+        } else if !ValidateFileSize(path, f.minSize) {
+            needsDownload := true
+            Log("[WRN] " . f.name . " invalid, redownloading")
+        }
+        
+        if !needsDownload
             continue
         
-        Log("[DL ] " . f.name)
-        local tmp := path . ".tmp"
+        ; Skip if file is locked
+        if SafeFileExists(path) && IsFileInUse(path) {
+            Log("[SKIP] " . f.name . " is in use")
+            if f.required
+                failed++
+            continue
+        }
         
-        try {
-            UrlDownloadToFile(baseUrl . f.name, tmp)
-            
-            if FileExist(tmp) {
-                local size := FileGetSize(tmp)
-                if (size > 0) {
-                    FileMove(tmp, path, 1)
-                    Log("[ OK ] " . f.name)
-                } else {
-                    FileDelete(tmp)
-                    Log("[ERR] " . f.name . " - empty file")
-                }
+        if DownloadFile(f.name, path) {
+            if ValidateFileSize(path, f.minSize) {
+                Log("[ OK ] " . f.name . " (" . FormatFileSize(SafeFileSize(path)) . ")")
+                downloaded++
             } else {
-                Log("[ERR] " . f.name . " - download failed")
+                Log("[ERR] " . f.name . " downloaded but size invalid")
+                try FileDelete(path)
+                if f.required
+                    failed++
             }
-        } catch as e {
-            if FileExist(tmp)
-                FileDelete(tmp)
-            Log("[ERR] " . f.name . " - " . e.Message)
+        } else {
+            Log("[ERR] " . f.name . " download failed")
+            if f.required
+                failed++
         }
     }
     
     Log("[SYS] ═══ COMPLETE ═══")
+    Log("[SYS] Downloaded: " . downloaded . " | Failed: " . failed)
+    
+    ; Final validation
+    if (missingRequired.Length > 0 || invalidRequired.Length > 0 || failed > 0) {
+        local allMissing := missingRequired.Clone()
+        for m in invalidRequired
+            allMissing.Push(m)
+        
+        if (allMissing.Length > 0) {
+            Log("[ERR] Required files missing/invalid: " . allMissing.Join(", "))
+            STATE.lastError := "Required files missing"
+            STATE.setupComplete := false
+            return false
+        }
+    }
+    
+    STATE.setupComplete := true
+    return true
 }
 
-; ===== DLL CALLS =====
+DownloadFile(filename, destPath) {
+    local url := CONFIG.baseUrl . filename
+    local tmpPath := destPath . ".tmp"
+    
+    ; Clean up any existing temp
+    if SafeFileExists(tmpPath)
+        try FileDelete(tmpPath)
+    
+    for attempt := 1 to CONFIG.maxRetries {
+        if (attempt > 1) {
+            Log("[DL ] Retry " . attempt . "/" . CONFIG.maxRetries . ": " . filename)
+            Sleep(CONFIG.retryDelay * attempt)
+        }
+        
+        try {
+            ; Use WinHTTP for more reliable downloads
+            local success := WinHttpDownload(url, tmpPath)
+            
+            if !success {
+                ; Fallback to UrlDownloadToFile
+                UrlDownloadToFile(url, tmpPath)
+            }
+            
+            if SafeFileExists(tmpPath) {
+                local size := SafeFileSize(tmpPath)
+                if (size > 0) {
+                    ; Move to final location
+                    if SafeFileExists(destPath) {
+                        if IsFileInUse(destPath) {
+                            Log("[SKIP] " . filename . " destination locked")
+                            try FileDelete(tmpPath)
+                            return false
+                        }
+                        try FileDelete(destPath)
+                    }
+                    FileMove(tmpPath, destPath, 1)
+                    return true
+                } else {
+                    try FileDelete(tmpPath)
+                }
+            }
+        } catch as e {
+            STATE.lastError := e.Message
+            if SafeFileExists(tmpPath)
+                try FileDelete(tmpPath)
+        }
+    }
+    
+    return false
+}
+
+WinHttpDownload(url, destPath) {
+    try {
+        local whr := ComObjCreate("Msxml2.XMLHTTP")
+        whr.Open("GET", url, true)
+        whr.Send()
+        whr.WaitForResponse(CONFIG.downloadTimeout / 1000)
+        
+        if (whr.Status = 200) {
+            local adodb := ComObjCreate("ADODB.Stream")
+            adodb.Type := 1  ; adTypeBinary
+            adodb.Open()
+            adodb.Write(whr.ResponseBody)
+            adodb.SaveToFile(destPath, 2)  ; adSaveCreateOverWrite
+            adodb.Close()
+            return true
+        }
+    }
+    return false
+}
+
+BuildPath(fileDef) {
+    return (fileDef.dir ? A_ScriptDir . "\" . fileDef.dir . "\" : A_ScriptDir . "\") . fileDef.name
+}
+
+FormatFileSize(bytes) {
+    if (bytes < 1024)
+        return bytes . " B"
+    if (bytes < 1048576)
+        return Round(bytes / 1024, 1) . " KB"
+    return Round(bytes / 1048576, 1) . " MB"
+}
+
+; ===== DLL CALLS WITH SAFETY =====
 
 Initialize() {
-    if !FileExist(DLL_PATH) {
-        Log("[ERR] Cloudy.dll missing")
+    if !SafeFileExists(CONFIG.dllPath) {
+        Log("[ERR] Cloudy.dll not found")
         return false
     }
+    
+    if IsFileInUse(CONFIG.dllPath) && !STATE.isRegistered {
+        Log("[WRN] Cloudy.dll locked by another process")
+    }
+    
     try {
-        local result := DllCall(DLL_PATH "\Initialize", "Int", "CDecl")
+        local result := DllCall(CONFIG.dllPath "\Initialize", "Int", "CDecl")
         Log("[ OK ] Initialized")
         return true
     } catch as e {
-        Log("[ERR] " . e.Message)
+        Log("[ERR] Init failed: " . e.Message)
+        STATE.lastError := "DLL init: " . e.Message
         return false
     }
 }
 
 ExecuteScript(script) {
+    ; Input validation
     if !isRegistered {
-        Log("[ERR] Not registered")
+        Log("[ERR] Not registered - click INIT first")
         return false
+    }
+    
+    if (StrLen(script) = 0) {
+        Log("[ERR] Empty script")
+        return false
+    }
+    
+    if (StrLen(script) > CONFIG.maxScriptSize) {
+        Log("[ERR] Script too large (" . StrLen(script) . " chars, max " . CONFIG.maxScriptSize . ")")
+        return false
+    }
+    
+    ; Large script confirmation
+    if (StrLen(script) > CONFIG.largeScriptThreshold) {
+        local choice := MsgBox(
+            "Large script detected (" . StrLen(script) . " characters).`n`nExecute anyway?",
+            "Confirm Execution",
+            "52 YesNo Icon?")
+        if (choice = "No")
+            return false
     }
     
     local clients := GetClients()
     if !clients.Length {
-        Log("[ERR] No clients")
+        Log("[ERR] No clients connected - inject first")
         return false
     }
     
+    ; Safe buffer allocation
     local scriptSize := StrPut(script, "UTF-8")
+    if (scriptSize = 0) {
+        Log("[ERR] Failed to encode script")
+        return false
+    }
+    
     local scriptBytes := Buffer(scriptSize)
     StrPut(script, scriptBytes, "UTF-8")
 
     local numClients := clients.Length
     local ptrArray := Buffer(numClients * A_PtrSize)
-    local strings := []
+    local stringBuffers := []  ; Prevent GC
     
     for i, c in clients {
+        if (StrLen(c.name) = 0)
+            continue
+            
         local nameSize := StrPut(c.name, "UTF-8")
+        if (nameSize = 0)
+            continue
+            
         local buf := Buffer(nameSize)
         StrPut(c.name, buf, "UTF-8")
-        strings.Push(buf)
+        stringBuffers.Push(buf)
         NumPut(buf.Ptr, ptrArray, (i - 1) * A_PtrSize, "Ptr")
     }
     
     try {
-        DllCall(DLL_PATH "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients, "CDecl")
+        DllCall(CONFIG.dllPath "\ExecuteAsync", "Int", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients, "CDecl")
         Log("[ OK ] Script executed")
         return true
     } catch as e {
-        Log("[ERR] " . e.Message)
+        Log("[ERR] Execute failed: " . e.Message)
+        STATE.lastError := "Execute: " . e.Message
         return false
     }
 }
 
 GetClients() {
     local clients := []
-    if !FileExist(DLL_PATH)
+    if !SafeFileExists(CONFIG.dllPath)
         return clients
+    
     try {
-        local ptr := DllCall(DLL_PATH "\GetClients", "Ptr", "CDecl")
+        local ptr := DllCall(CONFIG.dllPath "\GetClients", "Ptr", "CDecl")
         if !ptr
             return clients
         
+        ; Calculate struct size safely
         local structSize := (A_PtrSize * 2) + 4
         if (Mod(structSize, A_PtrSize) != 0)
             structSize += (A_PtrSize - Mod(structSize, A_PtrSize))
         
         loop 50 {
             local offset := (A_Index - 1) * structSize
-            local namePtr := NumGet(ptr, offset + A_PtrSize, "Ptr")
+            
+            ; Read name pointer first - null means end of list
+            local namePtr := 0
+            try {
+                namePtr := NumGet(ptr, offset + A_PtrSize, "Ptr")
+            } catch {
+                break
+            }
+            
             if !namePtr
                 break
-            local versionPtr := NumGet(ptr, offset, "Ptr")
-            local id := NumGet(ptr, offset + (A_PtrSize * 2), "Int")
-            local name := StrGet(namePtr, "UTF-8")
-            local version := (versionPtr ? StrGet(versionPtr, "UTF-8") : "")
-            clients.Push({name: name, version: version, id: id})
+            
+            ; Validate pointer is in reasonable range
+            if (namePtr < 0x10000 || namePtr > 0x7FFFFFFFFFFF)
+                break
+            
+            local versionPtr := 0
+            local id := 0
+            local name := ""
+            local version := ""
+            
+            try {
+                versionPtr := NumGet(ptr, offset, "Ptr")
+                id := NumGet(ptr, offset + (A_PtrSize * 2), "Int")
+                
+                if (versionPtr > 0x10000 && versionPtr < 0x7FFFFFFFFFFF)
+                    version := StrGet(versionPtr, "UTF-8")
+                
+                name := StrGet(namePtr, "UTF-8")
+            } catch {
+                break
+            }
+            
+            if (StrLen(name) > 0 && StrLen(name) < 100)
+                clients.Push({name: name, version: version, id: id})
         }
     } catch as e {
         Log("[WRN] GetClients: " . e.Message)
     }
+    
     return clients
 }
 
 Inject() {
     if !isRegistered
         Register("CLOUDY")
+    
+    if !STATE.setupComplete {
+        Log("[ERR] Setup incomplete - click REINSTALL")
+        return false
+    }
+    
     if !Initialize()
         return false
+    
     Sleep(2000)
+    
     local notif := 'game:GetService("StarterGui"):SetCore("SendNotification", {Title = "CLOUDY", Text = "INJECTED"})'
     local result := ExecuteScript(notif)
-    if result
+    
+    if result {
         injected := true
+        Log("[SYS] Injection complete")
+    }
+    
     return result
 }
 
@@ -181,17 +482,26 @@ Register(msg) {
     Log("[ OK ] Registered: " . msg)
 }
 
+; ===== PROCESS HELPERS =====
+
 IsRobloxOpen() {
+    STATE.robloxDetected := false
     try {
-        for p in ComObjGet("winmgmts:").ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        local wmi := ComObjGet("winmgmts:")
+        local query := wmi.ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        for p in query {
+            STATE.robloxDetected := true
             return true
+        }
+    } catch {
+        Log("[WRN] WMI query failed")
     }
     return false
 }
 
 GetUsername() {
     local path := A_LocalAppData . "\Roblox\LocalStorage\appStorage.json"
-    if !FileExist(path)
+    if !SafeFileExists(path)
         return ""
     try {
         local content := FileRead(path, "UTF-8")
@@ -201,51 +511,92 @@ GetUsername() {
     return ""
 }
 
-; ===== LOGGING =====
+KillRoblox() {
+    local killed := 0
+    try {
+        local wmi := ComObjGet("winmgmts:")
+        local query := wmi.ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        for p in query {
+            try {
+                p.Terminate()
+                killed++
+            } catch {
+                Log("[WRN] Failed to terminate PID " . p.ProcessId)
+            }
+        }
+    } catch {
+        Log("[WRN] WMI query failed")
+    }
+    
+    if killed {
+        Log("[SYS] Terminated " . killed . " process(es)")
+        injected := false
+        STATE.robloxDetected := false
+    } else {
+        Log("[SYS] No Roblox processes found")
+    }
+}
+
+; ===== SAFE LOGGING =====
 
 Log(msg) {
     local ts := Format("{:02d}:{:02d}:{:02d}", A_Hour, A_Min, A_Sec)
     local line := "[" . ts . "] " . msg
-    consoleLines.Push(line)
-    if consoleLines.Length > 200
-        consoleLines.RemoveAt(1)
-    if gui {
-        local out := ""
-        for l in consoleLines
-            out .= l . "`n"
-        try {
-            gui["_Console"].Value := out
-            local len := StrLen(out)
-            gui["_Console"].EditSelStart := (len > 0 ? len - 1 : 0)
-        }
-    }
+    
+    STATE.consoleLines.Push(line)
+    if STATE.consoleLines.Length > CONFIG.maxLogLines
+        STATE.consoleLines.RemoveAt(1)
+    
+    UpdateGUIConsole()
     UpdateStatus()
 }
 
-UpdateStatus() {
-    if !gui
+UpdateGUIConsole() {
+    if !STATE.gui
         return
+    
+    local out := ""
+    for l in STATE.consoleLines
+        out .= l . "`n"
+    
+    try {
+        STATE.gui["_Console"].Value := out
+        local len := StrLen(out)
+        STATE.gui["_Console"].EditSelStart := (len > 0 ? len - 1 : 0)
+    }
+}
+
+UpdateStatus() {
+    if !STATE.gui
+        return
+    
     local status := "IDLE"
     local color := "c808080"
+    
     if injected {
         status := "INJECTED"
         color := "c00ff00"
     } else if isRegistered {
         status := "READY"
         color := "cffff00"
+    } else if STATE.setupComplete {
+        status := "SETUP OK"
+        color := "c00aaff"
     }
+    
     try {
-        gui["_Status"].Value := "● " . status
-        gui["_Status"].Opt(color)
+        STATE.gui["_Status"].Value := "● " . status
+        STATE.gui["_Status"].Opt(color)
     }
 }
 
 UpdateInfo() {
-    if !gui
+    if !STATE.gui
         return
     local username := GetUsername()
     local clients := GetClients()
-    gui["_Info"].Value := "USER: " . (username ? username : "---") . " | CLIENTS: " . clients.Length
+    local rbxStatus := STATE.robloxDetected ? "YES" : "NO"
+    STATE.gui["_Info"].Value := "USER: " . (username ? username : "---") . " | ROBLOX: " . rbxStatus . " | CLIENTS: " . clients.Length
 }
 
 ; ===== CRT EFFECT =====
@@ -256,77 +607,110 @@ StartCRTEffect() {
 
 CRTFlash() {
     animPhase++
-    if !gui
+    if !STATE.gui
         return
     try {
         if (Mod(animPhase, 10) = 0)
-            gui.Opt("+Border " . (Mod(animPhase, 20) = 0 ? "0x003300" : "0x002200"))
+            STATE.gui.Opt("+Border " . (Mod(animPhase, 20) = 0 ? "0x003300" : "0x002200"))
     }
 }
 
 ; ===== GUI =====
 
 BuildGUI() {
-    gui := Gui("+AlwaysOnTop -DPIScale +ToolWindow")
-    gui.BackColor := "0a0a0a"
-    gui.SetFont("s11", "Courier New")
+    STATE.gui := Gui("+AlwaysOnTop -DPIScale +ToolWindow")
+    local g := STATE.gui
+    g.BackColor := "0a0a0a"
+    g.SetFont("s11", "Courier New")
     
-    gui.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    gui.Add("Text", "w520 h90 c00ff00 Center", "   _______ __   _ _______ __   _  _____  _    _ _______`n  |_____| |  | | |_____| |  | | |     |  \  /  |_____|`n  |     | |__| | |     | |__| | |_____|   \/   |     |`n           E X E C U T O R")
-    gui.Add("Text", "w520 h2 c00ff00", "─────────────────────────────────────────────────────")
+    g.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
+    g.Add("Text", "w520 h90 c00ff00 Center", "   _______ __   _ _______ __   _  _____  _    _ _______`n  |_____| |  | | |_____| |  | | |     |  \  /  |_____|`n  |     | |__| | |     | |__| | |_____|   \/   |     |`n           E X E C U T O R")
+    g.Add("Text", "w520 h2 c00ff00", "─────────────────────────────────────────────────────")
     
-    gui.Add("Text", "w520 h20 c00ff00", "STATUS:")
-    gui.Add("Text", "w520 h25 v_Status c808080", "● IDLE")
-    gui.Add("Text", "w520 h18 v_Info c00aa00", "USER: --- | CLIENTS: 0")
+    g.Add("Text", "w520 h20 c00ff00", "STATUS:")
+    g.Add("Text", "w520 h25 v_Status c808080", "● IDLE")
+    g.Add("Text", "w520 h18 v_Info c00aa00", "USER: --- | ROBLOX: --- | CLIENTS: 0")
+    g.Add("Text", "w520 h16 v_Error c660000", "")
     
-    gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
-    gui.Add("Text", "w520 h18 c00ff00", "▓ SCRIPT INPUT ▓")
-    gui.Add("Edit", "w520 h140 v_Code -Wrap c00ff00 Background0a0a0a", "print('hello from cloudy')`ngame:GetService('StarterGui'):SetCore(`n  'SendNotification', {`n    Title = 'CLOUDY',`n    Text = 'working!'`n  }`n)")
+    g.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
+    g.Add("Text", "w520 h18 c00ff00", "▓ SCRIPT INPUT ▓")
+    g.Add("Edit", "w520 h130 v_Code -Wrap c00ff00 Background0a0a0a", "print('hello from cloudy')`ngame:GetService('StarterGui'):SetCore(`n  'SendNotification', {`n    Title = 'CLOUDY',`n    Text = 'working!'`n  }`n)")
     
-    gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
+    g.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
     
-    gui.Add("Button", "w120 h28 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => (Register("CLOUDY"), Initialize(), UpdateInfo()))
-    gui.Add("Button", "x+8 w120 h28 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => (Inject(), UpdateInfo()))
-    gui.Add("Button", "x+8 w120 h28 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => ExecuteScript(gui["_Code"].Value))
-    gui.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (consoleLines := [], gui["_Console"].Value := ""))
+    g.Add("Button", "w120 h28 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => SafeInit())
+    g.Add("Button", "x+8 w120 h28 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => SafeInject())
+    g.Add("Button", "x+8 w120 h28 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => SafeExecute())
+    g.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (STATE.consoleLines := [], g["_Console"].Value := ""))
     
-    gui.Add("Button", "w184 h28 c000000 Background444400 y+4", "[ REINSTALL FILES ]").OnEvent("Click", (*) => AutoSetup())
-    gui.Add("Button", "x+8 w160 h28 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
-    gui.Add("Button", "x+8 w148 h28 c000000 Background333333", "[ EXIT ]").OnEvent("Click", (*) => QuitApp())
+    g.Add("Button", "w184 h28 c000000 Background444400 y+4", "[ REINSTALL FILES ]").OnEvent("Click", (*) => SafeReinstall())
+    g.Add("Button", "x+8 w160 h28 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
+    g.Add("Button", "x+8 w148 h28 c000000 Background333333", "[ EXIT ]").OnEvent("Click", (*) => QuitApp())
     
-    gui.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
-    gui.Add("Text", "w520 h18 c00ff00", "▓ CONSOLE OUTPUT ▓")
-    gui.Add("Edit", "w520 h150 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
+    g.Add("Text", "w520 h2 c004400", "─────────────────────────────────────────────────────")
+    g.Add("Text", "w520 h18 c00ff00", "▓ CONSOLE OUTPUT ▓")
+    g.Add("Edit", "w520 h140 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
     
-    gui.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
-    gui.Add("Text", "w520 h16 c004400 Center", "v1.0 // CLOUDY x NYX // [ESC] EXIT")
+    g.Add("Text", "w520 h2 c00ff00", "═════════════════════════════════════════════════════")
+    g.Add("Text", "w520 h16 c004400 Center", "v1.1 // CLOUDY x NYX // [ESC] EXIT")
     
-    gui.Show("w540 h720", "CLOUDY // TERMINAL")
+    g.Show("w540 h720", "CLOUDY // TERMINAL")
     HotKey("Escape", (*) => QuitApp())
 }
 
-QuitApp() {
-    if gui
-        gui.Destroy()
-    ExitApp()
+; Safe button handlers
+SafeInit() {
+    STATE.lastError := ""
+    STATE.gui["_Error"].Value := ""
+    Register("CLOUDY")
+    Initialize()
+    UpdateInfo()
 }
 
-KillRoblox() {
-    try {
-        for p in ComObjGet("winmgmts:").ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'") {
-            try
-                p.Terminate()
-        }
+SafeInject() {
+    STATE.lastError := ""
+    STATE.gui["_Error"].Value := ""
+    if !STATE.setupComplete {
+        Log("[ERR] Setup incomplete")
+        STATE.gui["_Error"].Value := "Setup incomplete - click REINSTALL"
+        return
     }
-    Log("[SYS] Roblox terminated")
-    injected := false
+    Inject()
+    UpdateInfo()
+}
+
+SafeExecute() {
+    STATE.lastError := ""
+    STATE.gui["_Error"].Value := ""
+    local code := STATE.gui["_Code"].Value
+    if (StrLen(Trim(code)) = 0) {
+        Log("[ERR] No script entered")
+        STATE.gui["_Error"].Value := "No script entered"
+        return
+    }
+    ExecuteScript(code)
+}
+
+SafeReinstall() {
+    STATE.lastError := ""
+    STATE.gui["_Error"].Value := ""
+    STATE.setupComplete := false
+    AutoSetup()
+    UpdateInfo()
+}
+
+QuitApp() {
+    SetTimer(CRTFlash, 0)
+    if STATE.gui
+        try STATE.gui.Destroy()
+    ExitApp()
 }
 
 ; ===== BOOT SEQUENCE =====
 
 BootSequence() {
     Sleep(300)
-    Log("[SYS] CLOUDY TERMINAL v1.0")
+    Log("[SYS] CLOUDY TERMINAL v1.1")
     Sleep(100)
     Log("[SYS] INITIALIZING...")
     Sleep(150)
@@ -352,7 +736,11 @@ BootSequence() {
     Log("[SYS] ══════════════════════════")
 }
 
-; ===== START =====
+; ===== MAIN =====
+
+; Validate environment first
+if !ValidateEnvironment()
+    ExitApp()
 
 BuildGUI()
 AutoSetup()
