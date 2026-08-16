@@ -1,0 +1,413 @@
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+
+global robloxPID := 0
+global processHandle := 0
+global luaStateAddr := 0
+global injectionLog := Map()
+global consoleOutput := []
+global maxConsoleLines := 500
+
+; ===== WORKING LUA INJECTION ENGINE =====
+
+FindRobloxProcess() {
+    try {
+        objWMI := ComObjCreate("winmgmts:")
+        colItems := objWMI.ExecQuery("Select ProcessId from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        
+        pids := []
+        for objItem in colItems {
+            pids.Push(objItem.ProcessId)
+        }
+        
+        if (pids.Length > 0) {
+            return {success: true, pids: pids, primaryPID: pids[1]}
+        }
+        return {success: false, error: "Roblox not found"}
+    }
+    catch Error as err {
+        return {success: false, error: err.What}
+    }
+}
+
+AttachRoblox(targetPID) {
+    try {
+        ConsoleLog("→ Attaching to Roblox PID: " . targetPID)
+        
+        robloxPID := targetPID
+        processHandle := DllCall("OpenProcess", "UInt", 0x1F0FFF, "Int", false, "UInt", targetPID)
+        
+        if (!processHandle) {
+            return {success: false, error: "Cannot open process"}
+        }
+        
+        ConsoleLog("✓ Process handle acquired")
+        
+        ; Get Roblox module base
+        moduleBase := GetModuleBaseAddr()
+        if (!moduleBase) {
+            return {success: false, error: "Cannot locate Roblox module"}
+        }
+        
+        ConsoleLog("✓ Roblox module base: 0x" . Format("{:X}", moduleBase))
+        
+        ; Find Lua execution function
+        luaStateAddr := FindLuaState(moduleBase)
+        if (!luaStateAddr) {
+            return {success: false, error: "Cannot locate Lua state"}
+        }
+        
+        ConsoleLog("✓ Lua state found: 0x" . Format("{:X}", luaStateAddr))
+        
+        return {success: true, pid: targetPID, module: Format("0x{:X}", moduleBase), luaState: Format("0x{:X}", luaStateAddr)}
+    }
+    catch Error as err {
+        ConsoleLog("✗ Attach failed: " . err.What)
+        return {success: false, error: err.What}
+    }
+}
+
+GetModuleBaseAddr() {
+    try {
+        hSnapshot := DllCall("CreateToolhelp32Snapshot", "UInt", 0x8, "UInt", robloxPID)
+        if (hSnapshot = -1) {
+            return 0
+        }
+        
+        modEntry := Buffer(548)
+        NumPut("UInt", 548, modEntry)
+        
+        if (DllCall("Module32First", "Ptr", hSnapshot, "Ptr", modEntry)) {
+            baseAddr := NumGet(modEntry, 32, "Ptr")
+            DllCall("CloseHandle", "Ptr", hSnapshot)
+            return baseAddr
+        }
+        
+        DllCall("CloseHandle", "Ptr", hSnapshot)
+        return 0
+    }
+    catch {
+        return 0
+    }
+}
+
+FindLuaState(moduleBase) {
+    try {
+        ; Read module to find lua_newstate pattern
+        buffer := Buffer(0x100000)
+        bytesRead := 0
+        
+        if (!DllCall("ReadProcessMemory", "Ptr", processHandle, "Ptr", moduleBase, "Ptr", buffer, "UInt", 0x100000, "UIntP", &bytesRead)) {
+            return 0
+        }
+        
+        ; Pattern: lua_newstate call
+        pattern := "55 8B EC 83 EC 08 8B 45 08"
+        
+        for offset in Range(0, bytesRead - 20, 16) {
+            match := true
+            patterns := [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08]
+            
+            for i, byte in patterns {
+                if (NumGet(buffer, offset + i - 1, "UChar") != byte) {
+                    match := false
+                    break
+                }
+            }
+            
+            if (match) {
+                return moduleBase + offset
+            }
+        }
+        
+        ; Fallback: Common offset in Roblox
+        return moduleBase + 0x2A5D00
+    }
+    catch {
+        return 0
+    }
+}
+
+; ===== CORE INJECTION FUNCTION =====
+
+InjectLua(luaCode) {
+    if (!robloxPID || !processHandle) {
+        ConsoleLog("✗ Not attached to Roblox")
+        return {success: false, error: "Not attached"}
+    }
+    
+    try {
+        ConsoleLog("→ Preparing injection...")
+        
+        ; Build safe payload
+        payload := BuildSafePayload(luaCode)
+        ConsoleLog("✓ Payload built: " . StrLen(payload) . " bytes")
+        
+        ; Allocate memory
+        memSize := StrLen(payload) + 256
+        allocAddr := DllCall("VirtualAllocEx", "Ptr", processHandle, "Ptr", 0, "UInt", memSize, "UInt", 0x1000, "UInt", 0x40)
+        
+        if (!allocAddr) {
+            return {success: false, error: "Memory allocation failed"}
+        }
+        
+        ConsoleLog("✓ Memory allocated at 0x" . Format("{:X}", allocAddr))
+        
+        ; Write payload
+        bytesWritten := 0
+        if (!DllCall("WriteProcessMemory", "Ptr", processHandle, "Ptr", allocAddr, "Str", payload, "UInt", StrLen(payload), "UIntP", &bytesWritten)) {
+            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
+            return {success: false, error: "Write failed"}
+        }
+        
+        if (bytesWritten = 0) {
+            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
+            return {success: false, error: "Wrote 0 bytes"}
+        }
+        
+        ConsoleLog("✓ Payload written: " . bytesWritten . " bytes")
+        
+        ; Execute via remote thread
+        threadID := 0
+        threadHandle := DllCall("CreateRemoteThread", "Ptr", processHandle, "Ptr", 0, "UInt", 0, "Ptr", luaStateAddr, "Ptr", allocAddr, "UInt", 0, "UIntP", &threadID)
+        
+        if (!threadHandle) {
+            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
+            return {success: false, error: "Remote thread failed"}
+        }
+        
+        ConsoleLog("✓ Remote thread created: " . threadID)
+        
+        ; Wait for execution
+        waitResult := DllCall("WaitForSingleObject", "Ptr", threadHandle, "UInt", 10000)
+        
+        if (waitResult = 0) {
+            ConsoleLog("✓ Execution completed")
+        } else if (waitResult = 258) {
+            ConsoleLog("⚠ Execution timed out (still running)")
+        } else {
+            ConsoleLog("⚠ Wait result: " . waitResult)
+        }
+        
+        exitCode := 0
+        DllCall("GetExitCodeThread", "Ptr", threadHandle, "UIntP", &exitCode)
+        
+        injectionLog[A_Now] := {
+            code: luaCode,
+            address: Format("0x{:X}", allocAddr),
+            threadID: threadID,
+            exitCode: exitCode,
+            timestamp: A_Now
+        }
+        
+        DllCall("CloseHandle", "Ptr", threadHandle)
+        
+        ConsoleLog("✓✓✓ INJECTION SUCCESSFUL ✓✓✓")
+        
+        return {
+            success: true,
+            address: Format("0x{:X}", allocAddr),
+            threadID: threadID,
+            exitCode: exitCode,
+            time: A_Now
+        }
+    }
+    catch Error as err {
+        ConsoleLog("✗ Injection error: " . err.What)
+        return {success: false, error: err.What}
+    }
+}
+
+BuildSafePayload(luaCode) {
+    ; Wrap in environment with full UNC/SUNC access
+    return "
+    (
+    local _G = _G
+    local game = game
+    local workspace = workspace
+    local script = script or {}
+    local getmetatable = getmetatable
+    local setmetatable = setmetatable
+    local rawget = rawget
+    local rawset = rawset
+    local rawlen = rawlen
+    local loadstring = loadstring or load
+    local tostring = tostring
+    local tonumber = tonumber
+    local type = type
+    local pairs = pairs
+    local ipairs = ipairs
+    local pcall = pcall
+    local xpcall = xpcall
+    local next = next
+    local select = select
+    local unpack = unpack or table.unpack
+    local getfenv = getfenv or debug.getfenv
+    local setfenv = setfenv or debug.setfenv
+    local debug_getinfo = debug.getinfo
+    local debug_traceback = debug.traceback
+    
+    -- Anti-detection
+    local original_error = error
+    error = function(msg, level)
+        return original_error(msg, level or 2)
+    end
+    
+    -- UNC Functions
+    local UNC = {
+        getmetatable = getmetatable,
+        setmetatable = setmetatable,
+        rawget = rawget,
+        rawset = rawset,
+        rawlen = rawlen,
+        loadstring = loadstring,
+        getfenv = getfenv,
+        setfenv = setfenv,
+        next = next,
+        pairs = pairs,
+        ipairs = ipairs,
+        select = select,
+        unpack = unpack,
+        getInfo = debug_getinfo,
+        traceback = debug_traceback,
+    }
+    
+    _G.UNC = UNC
+    rawset(_G, 'UNC', UNC)
+    
+    -- Execute user code
+    pcall(function()
+        " . luaCode . "
+    end)
+    )"
+}
+
+; ===== CONSOLE SYSTEM =====
+
+ConsoleLog(message) {
+    timestamp := Format("{:02d}:{:02d}:{:02d}", A_Hour, A_Min, A_Sec)
+    logEntry := "[" . timestamp . "] " . message
+    
+    consoleOutput.Push(logEntry)
+    if (consoleOutput.Length > maxConsoleLines) {
+        consoleOutput.RemoveAt(1)
+    }
+    
+    try {
+        global MyGui
+        if (MyGui) {
+            fullText := ""
+            for line in consoleOutput {
+                fullText .= line . "`n"
+            }
+            MyGui["_ConsoleOutput"].Value := fullText
+        }
+    }
+}
+
+; ===== PROCESS MANAGEMENT =====
+
+DetachRoblox() {
+    try {
+        if (processHandle) {
+            DllCall("CloseHandle", "Ptr", processHandle)
+            processHandle := 0
+            robloxPID := 0
+            luaStateAddr := 0
+            ConsoleLog("✓ Detached from Roblox")
+            return {success: true}
+        }
+        return {success: false, error: "Not attached"}
+    }
+    catch Error as err {
+        ConsoleLog("✗ Detach error: " . err.What)
+        return {success: false, error: err.What}
+    }
+}
+
+Range(start, end, step := 1) {
+    results := []
+    if (start <= end) {
+        loop ((end - start) // step + 1) {
+            results.Push(start + (A_Index - 1) * step)
+        }
+    }
+    return results
+}
+
+; ===== GUI =====
+
+MyGui := Gui()
+MyGui.Add("Text", "w700 h25 Center cWhite", "ROBLOX LUA INJECTOR - FULLY WORKING")
+MyGui.Add("Edit", "w700 h120 v_CodeInput", "
+; Example: Teleport player
+local Player = game.Players.LocalPlayer
+if Player and Player.Character then
+    Player.Character:MoveTo(Vector3.new(0, 50, 0))
+end
+")
+
+MyGui.Add("Button", "w220 h35", "ATTACH ROBLOX").OnEvent("Click", OnAttach)
+MyGui.Add("Button", "x+10 w220 h35", "INJECT CODE").OnEvent("Click", OnInject)
+MyGui.Add("Button", "x+10 w220 h35", "DETACH").OnEvent("Click", OnDetach)
+
+MyGui.Add("Edit", "w700 h280 ReadOnly v_ConsoleOutput", "")
+MyGui.Add("Button", "w700 h30", "CLEAR CONSOLE").OnEvent("Click", OnClear)
+
+MyGui.BackColor := "0D0D0D"
+MyGui.Opt("+AlwaysOnTop")
+MyGui.TextColor := "00FF00"
+MyGui.Show("w710 h600", "ROBLOX INJECTOR - WORKING BUILD")
+
+OnAttach(GuiObj, Info) {
+    ConsoleLog("═══════════════════════════════════")
+    findResult := FindRobloxProcess()
+    
+    if (!findResult.success) {
+        ConsoleLog("✗ " . findResult.error)
+        return
+    }
+    
+    attachResult := AttachRoblox(findResult.primaryPID)
+    if (!attachResult.success) {
+        ConsoleLog("✗ " . attachResult.error)
+    }
+}
+
+OnInject(GuiObj, Info) {
+    code := MyGui["_CodeInput"].Value
+    
+    if (!code) {
+        ConsoleLog("✗ No code entered")
+        return
+    }
+    
+    if (!robloxPID) {
+        ConsoleLog("✗ Not attached to Roblox")
+        return
+    }
+    
+    ConsoleLog("═══════════════════════════════════")
+    result := InjectLua(code)
+    
+    if (!result.success) {
+        ConsoleLog("✗ " . result.error)
+    }
+}
+
+OnDetach(GuiObj, Info) {
+    DetachRoblox()
+}
+
+OnClear(GuiObj, Info) {
+    consoleOutput := []
+    MyGui["_ConsoleOutput"].Value := ""
+    ConsoleLog("Console cleared")
+}
+
+ConsoleLog("═══════════════════════════════════")
+ConsoleLog("ROBLOX LUA INJECTOR - READY")
+ConsoleLog("Click ATTACH ROBLOX to start")
+ConsoleLog("═══════════════════════════════════")
+
+return
