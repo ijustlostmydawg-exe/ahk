@@ -20,8 +20,8 @@ global CONFIG := {
     logo: "   _______ __   _ _______ __   _  _____  _    _ _______" . "`n"
          . "  |_____| |  | | |_____| |  | | |     |  \  /  |_____|" . "`n"
          . "  |     | |__| | |     | |__| | |_____|   \/   |     |" . "`n"
-         . "          E X E C U T O R   v1.3",
-    footer: "v1.3 // CLOUDY x NYX // [ESC] EXIT",
+         . "          E X E C U T O R   v1.4",
+    footer: "v1.4 // CLOUDY x NYX // [ESC] EXIT",
     defaultScript: "
 (
 print('hello from cloudy')
@@ -43,7 +43,7 @@ global STATE := {
     animPhase: 0,
     robloxPids: [],
     lastLogWriteOk: true,
-    clientRefreshTimer: 0
+    logErrorDetail: ""
 }
 
 global REQUIRED_FILES := [
@@ -85,19 +85,79 @@ EnsureDirExists(filePath) {
         DirCreate(dir)
 }
 
+; Run PowerShell with Base64-encoded command for safe quoting
+RunPS(psCommand) {
+    local output := ""
+    local stderr := ""
+    try {
+        ; Encode command to Base64 to avoid all quoting issues
+        local encoded := CmdToBase64(psCommand)
+        local cmd := "powershell -NoProfile -NonInteractive -EncodedCommand " . encoded
+        local exec := ComObjCreate("WScript.Shell").Exec('cmd /c "' . cmd . '"')
+        
+        ; Read stdout with timeout
+        local timeout := 30000
+        local start := A_TickCount
+        while !exec.Status && ((A_TickCount - start) < timeout)
+            Sleep(50)
+        
+        if exec.Status
+            output := exec.StdOut.ReadAll()
+        else
+            output := "[TIMEOUT]"
+            
+        stderr := exec.StdErr.ReadAll()
+    } catch as e {
+        output := "[EXEC ERROR: " . e.Message . "]"
+    }
+    return {stdout: Trim(output), stderr: Trim(stderr)}
+}
+
+CmdToBase64(cmd) {
+    ; UTF-16LE encoding required for PowerShell -EncodedCommand
+    local buf := Buffer(StrPut(cmd, "UTF-16LE"))
+    StrPut(cmd, buf, "UTF-16LE")
+    return CryptEncode(buf, buf.Size - 2)
+}
+
+CryptEncode(data, length) {
+    local encodedSize := 0
+    ; Calculate required size
+    DllCall("crypt32.dll\CryptBinaryToStringW", 
+        "Ptr", data, 
+        "UInt", length, 
+        "UInt", 0x00000001,  ; CRYPT_STRING_BASE64
+        "Ptr", 0, 
+        "UIntP", &encodedSize, 
+        "Int")
+    
+    local outBuf := Buffer(encodedSize * 2)
+    DllCall("crypt32.dll\CryptBinaryToStringW", 
+        "Ptr", data, 
+        "UInt", length, 
+        "UInt", 0x00000001, 
+        "Ptr", outBuf, 
+        "UIntP", &encodedSize, 
+        "Int")
+    
+    return StrGet(outBuf, "UTF-16").Replace("`r`n", "")
+}
+
 ; ===== SHA256 VERIFICATION =====
 
 class HashVerifier {
     static GetFileHash(filePath) {
         if !FileExist(filePath)
             return ""
-        try {
-            local cmd := 'powershell -NoProfile -Command "(Get-FileHash -Path ''' . StrReplace(filePath, "'", "''") . ''' -Algorithm SHA256).Hash"'
-            local hash := Trim(RunCmd(cmd))
-            return (hash ? StrLower(hash) : "")
-        } catch {
+        
+        local psCmd := '(Get-FileHash -Path "' . StrReplace(filePath, '"', '\"') . '" -Algorithm SHA256).Hash'
+        local result := RunPS(psCmd)
+        
+        if (result.stderr != "")
             return ""
-        }
+        
+        local hash := Trim(result.stdout)
+        return (hash ? StrLower(hash) : "")
     }
     
     static VerifyFile(filePath, expectedHash) {
@@ -107,42 +167,31 @@ class HashVerifier {
         return (actual && StrLower(actual) = StrLower(expectedHash))
     }
     
+    ; Uses PowerShell ConvertFrom-Json for robust parsing
     static LoadManifest(manifestPath) {
         if !FileExist(manifestPath)
             return Map()
-        try {
-            local content := FileRead(manifestPath, "UTF-8")
-            local manifest := Map()
-            content := Trim(content)
-            if (SubStr(content, 1, 1) = "{")
-                content := SubStr(content, 2, -1)
-            if (SubStr(content, -1) = "}")
-                content := SubStr(content, 1, -1)
-            
-            local pairs := StrSplit(content, ",")
-            for pair in pairs {
-                pair := Trim(pair)
-                ; Tolerant regex for JSON key-value
-                if RegExMatch(pair, """([^""]+)""\s*:\s*""((?:[^""]|\\.)*)""", &m) {
-                    manifest[m[1]] := m[2]
-                }
-            }
+        
+        local psCmd := '$m = Get-Content -Path "' . StrReplace(manifestPath, '"', '\"') . '" -Raw | ConvertFrom-Json; $m.PSObject.Properties | ForEach-Object { "$($_.Name)|$($_.Value)" }'
+        local result := RunPS(psCmd)
+        
+        local manifest := Map()
+        if (result.stderr != "" || result.stdout = "")
             return manifest
-        } catch {
-            return Map()
+        
+        ; Parse "filename|hash" lines
+        local lines := StrSplit(result.stdout, "`n")
+        for line in lines {
+            line := Trim(line)
+            if (line = "")
+                continue
+            local parts := StrSplit(line, "|", , 2)
+            if (parts.Length = 2)
+                manifest[Trim(parts[1])] := Trim(parts[2])
         }
+        
+        return manifest
     }
-}
-
-RunCmd(cmd) {
-    local output := ""
-    try {
-        local exec := ComObjCreate("WScript.Shell").Exec("cmd /c " . cmd)
-        while !exec.Status
-            Sleep(10)
-        output := exec.StdOut.ReadAll()
-    }
-    return Trim(output)
 }
 
 ; ===== AUTO-SETUP =====
@@ -205,9 +254,15 @@ AutoSetup() {
             continue
         }
         
-        ; Prevent replacing loaded DLLs
+        ; Skip replacing loaded DLL
         if (f.name = "Cloudy.dll" && STATE.isRegistered) {
-            Log("[SKIP] Cloudy.dll is in use. Restart to update.")
+            Log("[SKIP] Cloudy.dll in use - restart to update")
+            continue
+        }
+        
+        ; Check if file is locked by another process
+        if FileExist(path) && IsFileLocked(path) {
+            Log("[SKIP] " . f.name . " locked by another process")
             continue
         }
         
@@ -224,7 +279,7 @@ AutoSetup() {
             if f.required
                 failedRequired.Push(f.name)
             if FileExist(path)
-                FileDelete(path)
+                try FileDelete(path)
         }
     }
     
@@ -233,7 +288,8 @@ AutoSetup() {
     
     if failedRequired.Length > 0 {
         Log("[ERR] Required files missing: " . failedRequired.Join(", "))
-        MsgBox("Failed to download required files: " . failedRequired.Join(", ") . "`nCheck your internet connection and click REINSTALL.", "Setup Error", 48)
+        ; FIXED: Correct AHK v2 MsgBox syntax
+        MsgBox("Failed to download required files:`n" . failedRequired.Join(", ") . "`n`nCheck internet and click REINSTALL.", "Setup Error", "48 IconX")
         return false
     }
     
@@ -241,6 +297,28 @@ AutoSetup() {
         Log("[WRN] Optional files failed - internal mode may not work")
     
     return true
+}
+
+; Check if file is locked
+IsFileLocked(filePath) {
+    try {
+        local handle := DllCall("kernel32.dll\CreateFileW", 
+            "Str", filePath,
+            "UInt", 0x80000000,  ; GENERIC_READ
+            "UInt", 0,            ; FILE_SHARE_NONE
+            "Ptr", 0,
+            "UInt", 3,            ; OPEN_EXISTING
+            "UInt", 0x80,         ; FILE_ATTRIBUTE_NORMAL
+            "Ptr", 0, "Ptr")
+        
+        if (handle = -1)
+            return true  ; Locked
+        
+        DllCall("kernel32.dll\CloseHandle", "Ptr", handle)
+        return false
+    } catch {
+        return true
+    }
 }
 
 DownloadWithRetry(url, destPath, showProgress := true, expectedHash := "") {
@@ -251,7 +329,7 @@ DownloadWithRetry(url, destPath, showProgress := true, expectedHash := "") {
     
     for attempt := 1 to CONFIG.maxDownloadRetries {
         if FileExist(tempPath)
-            FileDelete(tempPath)
+            try FileDelete(tempPath)
         
         if showProgress && (attempt > 1)
             Log("[DL ] Retry " . attempt . "/" . CONFIG.maxDownloadRetries . "...")
@@ -267,28 +345,28 @@ DownloadWithRetry(url, destPath, showProgress := true, expectedHash := "") {
             
             local size := FileGetSize(tempPath)
             if (size = 0) {
-                FileDelete(tempPath)
+                try FileDelete(tempPath)
                 lastError := "Empty file"
                 Sleep(CONFIG.downloadRetryDelay * attempt)
                 continue
             }
             
             if expectedHash && !HashVerifier.VerifyFile(tempPath, expectedHash) {
-                FileDelete(tempPath)
+                try FileDelete(tempPath)
                 lastError := "Hash mismatch"
                 Sleep(CONFIG.downloadRetryDelay * attempt)
                 continue
             }
             
             if FileExist(destPath)
-                FileDelete(destPath)
+                try FileDelete(destPath)
             FileMove(tempPath, destPath, 1)
             return true
             
         } catch as e {
             lastError := e.Message
             if FileExist(tempPath)
-                FileDelete(tempPath)
+                try FileDelete(tempPath)
             Sleep(CONFIG.downloadRetryDelay * attempt)
         }
     }
@@ -297,7 +375,8 @@ DownloadWithRetry(url, destPath, showProgress := true, expectedHash := "") {
     return false
 }
 
-; ===== DLL CALLS =====
+; ===== DLL CALLS (CORRECT PARAMETER ORDER) =====
+; AHK v2 DllCall: (func, ReturnType, ArgType1, ArgVal1, ..., "CallingConv")
 
 Initialize() {
     if !FileExist(CONFIG.dllPath) {
@@ -305,10 +384,10 @@ Initialize() {
         return false
     }
     try {
-        local result := DllCall(CONFIG.dllPath "\Initialize", "CDecl", "Int")
-        if (result != 0) {
+        ; FIXED: Return type first, calling convention LAST
+        local result := DllCall(CONFIG.dllPath "\Initialize", "Int", "CDecl")
+        if (result != 0)
             Log("[WRN] Initialize returned: " . result)
-        }
         Log("[ OK ] Initialized")
         return true
     } catch as e {
@@ -330,7 +409,8 @@ ExecuteScript(script) {
     }
     
     if (scriptLen > CONFIG.confirmLargeScript) {
-        local choice := MsgBox("Large script (" . scriptLen . " chars). Execute?", "Confirm", 52)
+        ; FIXED: Correct AHK v2 MsgBox syntax
+        local choice := MsgBox("Large script (" . scriptLen . " chars). Execute?", "Confirm", "52 YesNo Icon?")
         if (choice = "No")
             return false
     }
@@ -349,18 +429,17 @@ ExecuteScript(script) {
     for i, c in clients {
         local nameBuf := StringToBuffer(c.name, "UTF-8")
         stringBuffers.Push(nameBuf)
-        ; FIXED: Correct NumPut parameter order
         NumPut(nameBuf.Ptr, ptrArray, (i - 1) * A_PtrSize, "Ptr")
     }
     
     try {
-        ; Explicit return type "Int"
+        ; FIXED: Return type first, args, calling convention LAST
         local result := DllCall(CONFIG.dllPath "\ExecuteAsync", 
-            "CDecl", 
-            "Ptr", scriptBuf.Ptr,
-            "Ptr", ptrArray.Ptr,
-            "Int", numClients,
-            "Int")
+            "Int",                    ; Return type
+            "Ptr", scriptBuf.Ptr,     ; Arg 1: byte* scriptSource
+            "Ptr", ptrArray.Ptr,      ; Arg 2: char** clientUsers
+            "Int", numClients,        ; Arg 3: int numUsers
+            "CDecl")                  ; Calling convention
         Log("[ OK ] Script executed")
         return true
     } catch as e {
@@ -375,7 +454,8 @@ GetClients() {
         return clients
     
     try {
-        local ptr := DllCall(CONFIG.dllPath "\GetClients", "CDecl", "Ptr")
+        ; FIXED: Return type first, calling convention LAST
+        local ptr := DllCall(CONFIG.dllPath "\GetClients", "Ptr", "CDecl")
         if !ptr
             return clients
         
@@ -389,7 +469,6 @@ GetClients() {
             
             local namePtr := 0
             try {
-                ; FIXED: Safer NumGet usage
                 namePtr := NumGet(ptr, offset + ptrSize, "Ptr")
             } catch {
                 break
@@ -464,13 +543,11 @@ IsRobloxOpen() {
 }
 
 GetUsername() {
-    ; FIXED: Use A_LocalAppData instead of hardcoded path
     local path := A_LocalAppData . "\Roblox\LocalStorage\appStorage.json"
     if !FileExist(path)
         return ""
     try {
         local content := FileRead(path, "UTF-8")
-        ; FIXED: More tolerant regex for JSON
         if RegExMatch(content, """Username""\s*:\s*""((?:[^""]|\\.)*)""", &m)
             return m[1]
     }
@@ -507,16 +584,18 @@ LogToFile(msg) {
             if (size > CONFIG.maxLogSize) {
                 local backup := CONFIG.logFile . ".bak"
                 if FileExist(backup)
-                    FileDelete(backup)
-                FileMove(CONFIG.logFile, backup, 1)
+                    try FileDelete(backup)
+                try FileMove(CONFIG.logFile, backup, 1)
             }
         }
         EnsureDirExists(CONFIG.logFile)
         local ts := Format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}", A_Year, A_Mon, A_MDay, A_Hour, A_Min, A_Sec)
         FileAppend(ts . " " . msg . "`n", CONFIG.logFile, "UTF-8")
         STATE.lastLogWriteOk := true
-    } catch {
+        STATE.logErrorDetail := ""
+    } catch as e {
         STATE.lastLogWriteOk := false
+        STATE.logErrorDetail := e.Message  ; FIXED: Store error detail
     }
 }
 
@@ -527,10 +606,10 @@ Log(msg) {
     LogToFile(msg)
     
     if STATE.gui {
-        ; PERFORMANCE FIX: Use EM_REPLACESEL to append instead of rewriting entire control
-        static EM_REPLACESEL := 0x00C2
+        ; FIXED: Let AHK manage string lifetime, don't use raw StrPtr
         try {
-            SendMessage(EM_REPLACESEL, false, StrPtr(line . "`r`n"), STATE.gui["_Console"].Hwnd)
+            static EM_REPLACESEL := 0x00C2
+            SendMessage(EM_REPLACESEL, false, line . "`r`n", STATE.gui["_Console"])
             UpdateLogStatus()
         }
     }
@@ -541,9 +620,15 @@ Log(msg) {
 UpdateLogStatus() {
     if !STATE.gui
         return
-    local status := STATE.lastLogWriteOk ? "" : " [LOG ERR]"
-    STATE.gui["_LogStatus"].Value := status
-    STATE.gui["_LogStatus"].Opt(STATE.lastLogWriteOk ? "c004400" : "cff0000")
+    if STATE.lastLogWriteOk {
+        STATE.gui["_LogStatus"].Value := ""
+    } else {
+        STATE.gui["_LogStatus"].Value := "[LOG ERR]"
+        STATE.gui["_LogStatus"].Opt("cff0000")
+        ; Show error detail in tooltip on hover would be nice, but just log it
+        if (STATE.logErrorDetail != "")
+            Log("[WRN] Log write failed: " . STATE.logErrorDetail)
+    }
 }
 
 UpdateStatus() {
@@ -649,20 +734,20 @@ BuildGUI() {
     HotKey("Escape", (*) => QuitApp())
 }
 
-; CRITICAL FIX: Renamed to prevent recursion
+; FIXED: Renamed to avoid recursion, calls built-in with parentheses
 QuitApp() {
     StopCRTEffect()
     StopClientRefresh()
     if STATE.gui
         STATE.gui.Destroy()
-    ExitApp  ; Calls AHK built-in
+    ExitApp()  ; Built-in with parentheses
 }
 
 ; ===== BOOT SEQUENCE =====
 
 BootSequence() {
     Sleep(200)
-    Log("[SYS] CLOUDY TERMINAL v1.3")
+    Log("[SYS] CLOUDY TERMINAL v1.4")
     Sleep(80)
     Log("[SYS] Initializing subsystems...")
     Sleep(100)
