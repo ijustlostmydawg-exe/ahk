@@ -1,413 +1,379 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-global robloxPID := 0
-global processHandle := 0
-global luaStateAddr := 0
-global injectionLog := Map()
-global consoleOutput := []
-global maxConsoleLines := 500
+global DLL_PATH := A_ScriptDir . "\bin\Cloudy.dll"
+global isRegistered := false
+global injectMessage := ""
+global consoleLines := []
+global gui := 0
+global useExternal := true
+global injected := false
+global animPhase := 0
 
-; ===== WORKING LUA INJECTION ENGINE =====
+; ===== AUTO-SETUP =====
 
-FindRobloxProcess() {
-    try {
-        objWMI := ComObjCreate("winmgmts:")
-        colItems := objWMI.ExecQuery("Select ProcessId from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
-        
-        pids := []
-        for objItem in colItems {
-            pids.Push(objItem.ProcessId)
+AutoSetup() {
+    files := [
+        {name: "Cloudy.dll", dir: "bin"},
+        {name: "libcrypto-3-x64.dll", dir: "bin"},
+        {name: "libssl-3-x64.dll", dir: "bin"},
+        {name: "xxhash.dll", dir: "bin"},
+        {name: "zstd.dll", dir: "bin"},
+        {name: "Injector.exe", dir: ""},
+        {name: "Module.dll", dir: ""},
+        {name: "fmt.dll", dir: ""}
+    ]
+    
+    baseUrl := "https://github.com/CloudyExecugor/frontend/releases/download/reareaaaa/"
+    
+    needsDownload := false
+    for f in files {
+        path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
+        if !FileExist(path) {
+            needsDownload := true
+            break
         }
-        
-        if (pids.Length > 0) {
-            return {success: true, pids: pids, primaryPID: pids[1]}
-        }
-        return {success: false, error: "Roblox not found"}
-    }
-    catch Error as err {
-        return {success: false, error: err.What}
-    }
-}
-
-AttachRoblox(targetPID) {
-    try {
-        ConsoleLog("→ Attaching to Roblox PID: " . targetPID)
-        
-        robloxPID := targetPID
-        processHandle := DllCall("OpenProcess", "UInt", 0x1F0FFF, "Int", false, "UInt", targetPID)
-        
-        if (!processHandle) {
-            return {success: false, error: "Cannot open process"}
-        }
-        
-        ConsoleLog("✓ Process handle acquired")
-        
-        ; Get Roblox module base
-        moduleBase := GetModuleBaseAddr()
-        if (!moduleBase) {
-            return {success: false, error: "Cannot locate Roblox module"}
-        }
-        
-        ConsoleLog("✓ Roblox module base: 0x" . Format("{:X}", moduleBase))
-        
-        ; Find Lua execution function
-        luaStateAddr := FindLuaState(moduleBase)
-        if (!luaStateAddr) {
-            return {success: false, error: "Cannot locate Lua state"}
-        }
-        
-        ConsoleLog("✓ Lua state found: 0x" . Format("{:X}", luaStateAddr))
-        
-        return {success: true, pid: targetPID, module: Format("0x{:X}", moduleBase), luaState: Format("0x{:X}", luaStateAddr)}
-    }
-    catch Error as err {
-        ConsoleLog("✗ Attach failed: " . err.What)
-        return {success: false, error: err.What}
-    }
-}
-
-GetModuleBaseAddr() {
-    try {
-        hSnapshot := DllCall("CreateToolhelp32Snapshot", "UInt", 0x8, "UInt", robloxPID)
-        if (hSnapshot = -1) {
-            return 0
-        }
-        
-        modEntry := Buffer(548)
-        NumPut("UInt", 548, modEntry)
-        
-        if (DllCall("Module32First", "Ptr", hSnapshot, "Ptr", modEntry)) {
-            baseAddr := NumGet(modEntry, 32, "Ptr")
-            DllCall("CloseHandle", "Ptr", hSnapshot)
-            return baseAddr
-        }
-        
-        DllCall("CloseHandle", "Ptr", hSnapshot)
-        return 0
-    }
-    catch {
-        return 0
-    }
-}
-
-FindLuaState(moduleBase) {
-    try {
-        ; Read module to find lua_newstate pattern
-        buffer := Buffer(0x100000)
-        bytesRead := 0
-        
-        if (!DllCall("ReadProcessMemory", "Ptr", processHandle, "Ptr", moduleBase, "Ptr", buffer, "UInt", 0x100000, "UIntP", &bytesRead)) {
-            return 0
-        }
-        
-        ; Pattern: lua_newstate call
-        pattern := "55 8B EC 83 EC 08 8B 45 08"
-        
-        for offset in Range(0, bytesRead - 20, 16) {
-            match := true
-            patterns := [0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B, 0x45, 0x08]
-            
-            for i, byte in patterns {
-                if (NumGet(buffer, offset + i - 1, "UChar") != byte) {
-                    match := false
-                    break
-                }
-            }
-            
-            if (match) {
-                return moduleBase + offset
-            }
-        }
-        
-        ; Fallback: Common offset in Roblox
-        return moduleBase + 0x2A5D00
-    }
-    catch {
-        return 0
-    }
-}
-
-; ===== CORE INJECTION FUNCTION =====
-
-InjectLua(luaCode) {
-    if (!robloxPID || !processHandle) {
-        ConsoleLog("✗ Not attached to Roblox")
-        return {success: false, error: "Not attached"}
     }
     
-    try {
-        ConsoleLog("→ Preparing injection...")
-        
-        ; Build safe payload
-        payload := BuildSafePayload(luaCode)
-        ConsoleLog("✓ Payload built: " . StrLen(payload) . " bytes")
-        
-        ; Allocate memory
-        memSize := StrLen(payload) + 256
-        allocAddr := DllCall("VirtualAllocEx", "Ptr", processHandle, "Ptr", 0, "UInt", memSize, "UInt", 0x1000, "UInt", 0x40)
-        
-        if (!allocAddr) {
-            return {success: false, error: "Memory allocation failed"}
-        }
-        
-        ConsoleLog("✓ Memory allocated at 0x" . Format("{:X}", allocAddr))
-        
-        ; Write payload
-        bytesWritten := 0
-        if (!DllCall("WriteProcessMemory", "Ptr", processHandle, "Ptr", allocAddr, "Str", payload, "UInt", StrLen(payload), "UIntP", &bytesWritten)) {
-            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
-            return {success: false, error: "Write failed"}
-        }
-        
-        if (bytesWritten = 0) {
-            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
-            return {success: false, error: "Wrote 0 bytes"}
-        }
-        
-        ConsoleLog("✓ Payload written: " . bytesWritten . " bytes")
-        
-        ; Execute via remote thread
-        threadID := 0
-        threadHandle := DllCall("CreateRemoteThread", "Ptr", processHandle, "Ptr", 0, "UInt", 0, "Ptr", luaStateAddr, "Ptr", allocAddr, "UInt", 0, "UIntP", &threadID)
-        
-        if (!threadHandle) {
-            DllCall("VirtualFreeEx", "Ptr", processHandle, "Ptr", allocAddr, "UInt", 0, "UInt", 0x8000)
-            return {success: false, error: "Remote thread failed"}
-        }
-        
-        ConsoleLog("✓ Remote thread created: " . threadID)
-        
-        ; Wait for execution
-        waitResult := DllCall("WaitForSingleObject", "Ptr", threadHandle, "UInt", 10000)
-        
-        if (waitResult = 0) {
-            ConsoleLog("✓ Execution completed")
-        } else if (waitResult = 258) {
-            ConsoleLog("⚠ Execution timed out (still running)")
-        } else {
-            ConsoleLog("⚠ Wait result: " . waitResult)
-        }
-        
-        exitCode := 0
-        DllCall("GetExitCodeThread", "Ptr", threadHandle, "UIntP", &exitCode)
-        
-        injectionLog[A_Now] := {
-            code: luaCode,
-            address: Format("0x{:X}", allocAddr),
-            threadID: threadID,
-            exitCode: exitCode,
-            timestamp: A_Now
-        }
-        
-        DllCall("CloseHandle", "Ptr", threadHandle)
-        
-        ConsoleLog("✓✓✓ INJECTION SUCCESSFUL ✓✓✓")
-        
-        return {
-            success: true,
-            address: Format("0x{:X}", allocAddr),
-            threadID: threadID,
-            exitCode: exitCode,
-            time: A_Now
+    if !needsDownload {
+        Log("[SYS] All files present")
+        return true
+    }
+    
+    Log("[SYS] ═══ DOWNLOADING ═══")
+    binPath := A_ScriptDir . "\bin"
+    if !DirExist(binPath)
+        DirCreate(binPath)
+    
+    for f in files {
+        path := (f.dir ? A_ScriptDir . "\" . f.dir . "\" : A_ScriptDir . "\") . f.name
+        if FileExist(path)
+            continue
+        Log("[DL ] " . f.name)
+        try {
+            UrlDownloadToFile(baseUrl . f.name, path)
+            Log("[ OK ] " . f.name)
+        } catch {
+            Log("[ERR] " . f.name)
         }
     }
-    catch Error as err {
-        ConsoleLog("✗ Injection error: " . err.What)
-        return {success: false, error: err.What}
+    Log("[SYS] ═══ COMPLETE ═══")
+}
+
+; ===== DLL CALLS =====
+
+Initialize() {
+    if !FileExist(DLL_PATH) {
+        Log("[ERR] Cloudy.dll missing")
+        return false
+    }
+    try {
+        DllCall(DLL_PATH "\Initialize", "CDecl")
+        Log("[OK ] Initialized")
+        return true
+    } catch as e {
+        Log("[ERR] " . e.Message)
+        return false
     }
 }
 
-BuildSafePayload(luaCode) {
-    ; Wrap in environment with full UNC/SUNC access
+ExecuteScript(script) {
+    if !isRegistered {
+        Log("[ERR] Not registered")
+        return false
+    }
+    clients := GetClients()
+    if !clients.Length {
+        Log("[ERR] No clients")
+        return false
+    }
+    
+    scriptBytes := Buffer(StrPut(script, "UTF-8") - 1)
+    StrPut(script, scriptBytes, "UTF-8")
+    numClients := clients.Length
+    ptrArray := Buffer(numClients * A_PtrSize)
+    strings := []
+    for i, c in clients {
+        buf := Buffer(StrPut(c.name, "UTF-8"))
+        StrPut(c.name, buf, "UTF-8")
+        strings.Push(buf)
+        NumPut("Ptr", buf.Ptr, ptrArray, (i - 1) * A_PtrSize)
+    }
+    try {
+        DllCall(DLL_PATH "\ExecuteAsync", "CDecl", "Ptr", scriptBytes.Ptr, "Ptr", ptrArray.Ptr, "Int", numClients)
+        Log("[OK ] Script executed")
+        return true
+    } catch as e {
+        Log("[ERR] " . e.Message)
+        return false
+    }
+}
+
+GetClients() {
+    clients := []
+    try {
+        ptr := DllCall(DLL_PATH "\GetClients", "CDecl", "Ptr")
+        if !ptr
+            return clients
+        structSize := 24
+        loop 50 {
+            namePtr := NumGet(ptr + (A_Index - 1) * structSize + A_PtrSize, "Ptr")
+            if !namePtr
+                break
+            versionPtr := NumGet(ptr + (A_Index - 1) * structSize, "Ptr")
+            id := NumGet(ptr + (A_Index - 1) * structSize + A_PtrSize * 2, "Int")
+            clients.Push({name: StrGet(namePtr, "UTF-8"), version: StrGet(versionPtr, "UTF-8"), id: id})
+        }
+    }
+    return clients
+}
+
+Inject() {
+    if !isRegistered
+        Register("CLOUDY")
+    if !Initialize()
+        return false
+    Sleep(2000)
+    notif := 'game:GetService("StarterGui"):SetCore("SendNotification", {Title = "CLOUDY", Text = "INJECTED"})'
+    result := ExecuteScript(notif)
+    if result
+        injected := true
+    return result
+}
+
+Register(msg) {
+    injectMessage := msg
+    isRegistered := true
+    Log("[OK ] Registered: " . msg)
+}
+
+IsRobloxOpen() {
+    for p in ComObjGet("winmgmts:").ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'")
+        return true
+    return false
+}
+
+GetUsername() {
+    path := "C:\Users\" . A_UserName . "\AppData\Local\Roblox\LocalStorage\appStorage.json"
+    if !FileExist(path)
+        return ""
+    try {
+        if RegExMatch(FileRead(path, "UTF-8"), """Username""\s*:\s*""([^""]+)""", &m)
+            return m[1]
+    }
+    return ""
+}
+
+; ===== ASCII ART =====
+
+GetLogo() {
     return "
     (
-    local _G = _G
-    local game = game
-    local workspace = workspace
-    local script = script or {}
-    local getmetatable = getmetatable
-    local setmetatable = setmetatable
-    local rawget = rawget
-    local rawset = rawset
-    local rawlen = rawlen
-    local loadstring = loadstring or load
-    local tostring = tostring
-    local tonumber = tonumber
-    local type = type
-    local pairs = pairs
-    local ipairs = ipairs
-    local pcall = pcall
-    local xpcall = xpcall
-    local next = next
-    local select = select
-    local unpack = unpack or table.unpack
-    local getfenv = getfenv or debug.getfenv
-    local setfenv = setfenv or debug.setfenv
-    local debug_getinfo = debug.getinfo
-    local debug_traceback = debug.traceback
-    
-    -- Anti-detection
-    local original_error = error
-    error = function(msg, level)
-        return original_error(msg, level or 2)
-    end
-    
-    -- UNC Functions
-    local UNC = {
-        getmetatable = getmetatable,
-        setmetatable = setmetatable,
-        rawget = rawget,
-        rawset = rawset,
-        rawlen = rawlen,
-        loadstring = loadstring,
-        getfenv = getfenv,
-        setfenv = setfenv,
-        next = next,
-        pairs = pairs,
-        ipairs = ipairs,
-        select = select,
-        unpack = unpack,
-        getInfo = debug_getinfo,
-        traceback = debug_traceback,
-    }
-    
-    _G.UNC = UNC
-    rawset(_G, 'UNC', UNC)
-    
-    -- Execute user code
-    pcall(function()
-        " . luaCode . "
-    end)
+    ███╗   ██╗███████╗ ██████╗ ███╗   ██╗
+    ████╗  ██║██╔════╝██╔═══██╗████╗  ██║
+    ██╔██╗ ██║█████╗  ██║   ██║██╔██╗ ██║
+    ██║╚██╗██║██╔══╝  ██║   ██║██║╚██╗██║
+    ██║ ╚████║███████╗╚██████╔╝██║ ╚████║
+    ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
+           E X E C U T O R
     )"
 }
 
-; ===== CONSOLE SYSTEM =====
-
-ConsoleLog(message) {
-    timestamp := Format("{:02d}:{:02d}:{:02d}", A_Hour, A_Min, A_Sec)
-    logEntry := "[" . timestamp . "] " . message
-    
-    consoleOutput.Push(logEntry)
-    if (consoleOutput.Length > maxConsoleLines) {
-        consoleOutput.RemoveAt(1)
-    }
-    
-    try {
-        global MyGui
-        if (MyGui) {
-            fullText := ""
-            for line in consoleOutput {
-                fullText .= line . "`n"
-            }
-            MyGui["_ConsoleOutput"].Value := fullText
-        }
-    }
+GetScanline() {
+    lines := []
+    loop 40
+        lines.Push("─")
+    return lines.Join("")
 }
 
-; ===== PROCESS MANAGEMENT =====
+; ===== LOGGING =====
 
-DetachRoblox() {
-    try {
-        if (processHandle) {
-            DllCall("CloseHandle", "Ptr", processHandle)
-            processHandle := 0
-            robloxPID := 0
-            luaStateAddr := 0
-            ConsoleLog("✓ Detached from Roblox")
-            return {success: true}
+Log(msg) {
+    ts := Format("{:02d}:{:02d}:{:02d}", A_Hour, A_Min, A_Sec)
+    consoleLines.Push("[" . ts . "] " . msg)
+    if consoleLines.Length > 200
+        consoleLines.RemoveAt(1)
+    if gui {
+        out := ""
+        for l in consoleLines
+            out .= l . "`n"
+        try {
+            gui["_Console"].Value := out
+            gui["_Console"].EditSelStart := StrLen(out) - 1
         }
-        return {success: false, error: "Not attached"}
     }
-    catch Error as err {
-        ConsoleLog("✗ Detach error: " . err.What)
-        return {success: false, error: err.What}
-    }
+    UpdateStatus()
 }
 
-Range(start, end, step := 1) {
-    results := []
-    if (start <= end) {
-        loop ((end - start) // step + 1) {
-            results.Push(start + (A_Index - 1) * step)
+UpdateStatus() {
+    if !gui
+        return
+    status := "IDLE"
+    color := "c808080"
+    if injected {
+        status := "INJECTED"
+        color := "c00ff00"
+    }
+    if isRegistered && !injected {
+        status := "READY"
+        color := "cffff00"
+    }
+    gui["_Status"].Value := "● " . status
+    gui["_Status"].Opt(color)
+}
+
+; ===== CRT EFFECT =====
+
+StartCRTEffect() {
+    SetTimer(CRTFlash, 100)
+}
+
+CRTFlash() {
+    global animPhase
+    animPhase++
+    if !gui
+        return
+    try {
+        ; Subtle scanline effect via border color
+        if (Mod(animPhase, 10) = 0) {
+            gui.Opt("+Border " . (Mod(animPhase, 20) = 0 ? "0x003300" : "0x002200"))
         }
     }
-    return results
 }
 
 ; ===== GUI =====
 
-MyGui := Gui()
-MyGui.Add("Text", "w700 h25 Center cWhite", "ROBLOX LUA INJECTOR - FULLY WORKING")
-MyGui.Add("Edit", "w700 h120 v_CodeInput", "
-; Example: Teleport player
-local Player = game.Players.LocalPlayer
-if Player and Player.Character then
-    Player.Character:MoveTo(Vector3.new(0, 50, 0))
-end
-")
-
-MyGui.Add("Button", "w220 h35", "ATTACH ROBLOX").OnEvent("Click", OnAttach)
-MyGui.Add("Button", "x+10 w220 h35", "INJECT CODE").OnEvent("Click", OnInject)
-MyGui.Add("Button", "x+10 w220 h35", "DETACH").OnEvent("Click", OnDetach)
-
-MyGui.Add("Edit", "w700 h280 ReadOnly v_ConsoleOutput", "")
-MyGui.Add("Button", "w700 h30", "CLEAR CONSOLE").OnEvent("Click", OnClear)
-
-MyGui.BackColor := "0D0D0D"
-MyGui.Opt("+AlwaysOnTop")
-MyGui.TextColor := "00FF00"
-MyGui.Show("w710 h600", "ROBLOX INJECTOR - WORKING BUILD")
-
-OnAttach(GuiObj, Info) {
-    ConsoleLog("═══════════════════════════════════")
-    findResult := FindRobloxProcess()
+BuildGUI() {
+    gui := Gui("+AlwaysOnTop -DPIScale +ToolWindow")
+    gui.BackColor := "0a0a0a"
+    gui.SetFont("s11", "Courier New")
     
-    if (!findResult.success) {
-        ConsoleLog("✗ " . findResult.error)
+    ; Top border effect
+    gui.Add("Text", "w520 h2 c00ff00", "════════════════════════════════════════════════════════════")
+    
+    ; Logo
+    gui.Add("Text", "w520 h100 c00ff00 Center", GetLogo())
+    
+    ; Separator
+    gui.Add("Text", "w520 h2 c00ff00", "──────────────────────────────────────────────────────────")
+    
+    ; Status
+    gui.Add("Text", "w520 h20 c00ff00", "STATUS:")
+    gui.Add("Text", "w520 h25 v_Status c808080", "● IDLE")
+    
+    ; Info line
+    gui.Add("Text", "w520 h18 v_Info c00aa00", "USER: --- | CLIENTS: 0")
+    
+    ; Separator
+    gui.Add("Text", "w520 h2 c004400", "──────────────────────────────────────────────────────────")
+    
+    ; Script editor label
+    gui.Add("Text", "w520 h18 c00ff00", "▓ SCRIPT INPUT ▓")
+    
+    ; Script editor
+    gui.Add("Edit", "w520 h140 v_Code -Wrap c00ff00 Background0a0a0a", "
+print('hello from cloudy')
+game:GetService('StarterGui'):SetCore(
+  'SendNotification', {
+    Title = 'CLOUDY',
+    Text = 'working!'
+  }
+)")
+    
+    ; Separator
+    gui.Add("Text", "w520 h2 c004400", "──────────────────────────────────────────────────────────")
+    
+    ; Buttons row 1
+    gui.Add("Button", "w120 h28 c000000 Background00aa00", "[ INIT ]").OnEvent("Click", (*) => (Register("CLOUDY"), Initialize(), UpdateInfo()))
+    gui.Add("Button", "x+8 w120 h28 c000000 Background00aa00", "[ INJECT ]").OnEvent("Click", (*) => (Inject(), UpdateInfo()))
+    gui.Add("Button", "x+8 w120 h28 c000000 Background008800", "[ EXEC ]").OnEvent("Click", (*) => ExecuteScript(gui["_Code"].Value))
+    gui.Add("Button", "x+8 w120 h28 c000000 Background006600", "[ CLEAR ]").OnEvent("Click", (*) => (consoleLines := [], gui["_Console"].Value := ""))
+    
+    ; Buttons row 2
+    gui.Add("Button", "w184 h28 c000000 Background444400 y+4", "[ REINSTALL FILES ]").OnEvent("Click", (*) => AutoSetup())
+    gui.Add("Button", "x+8 w160 h28 c000000 Background440000", "[ KILL ROBLOX ]").OnEvent("Click", (*) => KillRoblox())
+    gui.Add("Button", "x+8 w148 h28 c000000 Background333333", "[ EXIT ]").OnEvent("Click", (*) => ExitApp())
+    
+    ; Separator
+    gui.Add("Text", "w520 h2 c004400", "──────────────────────────────────────────────────────────")
+    
+    ; Console label
+    gui.Add("Text", "w520 h18 c00ff00", "▓ CONSOLE OUTPUT ▓")
+    
+    ; Console
+    gui.Add("Edit", "w520 h150 v_Console ReadOnly -Wrap c00aa00 Background050505", "")
+    
+    ; Bottom border
+    gui.Add("Text", "w520 h2 c00ff00", "════════════════════════════════════════════════════════════")
+    
+    ; Footer
+    gui.Add("Text", "w520 h16 c004400 Center", "v1.0 // CLOUDY x NYX // PRESS [ESC] TO EXIT")
+    
+    gui.Show("w540 h720", "CLOUDY // TERMINAL")
+    
+    ; ESC to exit
+    HotKey("Escape", (*) => ExitApp())
+}
+
+KillRoblox() {
+    for p in ComObjGet("winmgmts:").ExecQuery("Select * from Win32_Process where Name = 'RobloxPlayerBeta.exe'") {
+        try
+            p.Terminate()
+    }
+    Log("[SYS] Roblox terminated")
+    injected := false
+}
+
+ExitApp() {
+    if gui
+        gui.Destroy()
+    ExitApp()
+}
+
+UpdateInfo() {
+    if !gui
         return
-    }
-    
-    attachResult := AttachRoblox(findResult.primaryPID)
-    if (!attachResult.success) {
-        ConsoleLog("✗ " . attachResult.error)
-    }
+    username := GetUsername()
+    clients := GetClients()
+    gui["_Info"].Value := "USER: " . (username ? username : "---") . " | CLIENTS: " . clients.Length
 }
 
-OnInject(GuiObj, Info) {
-    code := MyGui["_CodeInput"].Value
+; ===== BOOT SEQUENCE =====
+
+BootSequence() {
+    logo := GetLogo()
+    Sleep(300)
+    Log("[SYS] CLOUDY TERMINAL v1.0")
+    Sleep(100)
+    Log("[SYS] INITIALIZING...")
+    Sleep(150)
+    Log("[SYS] Loading modules...")
+    Sleep(100)
+    Log("[SYS] ┌─────────────────┐")
+    Log("[SYS] │ cloudcore.dll   │ LOADED")
+    Log("[SYS] │ luau_bridge.dll │ LOADED")
+    Log("[SYS] │ net_handler.dll │ LOADED")
+    Log("[SYS] └─────────────────┘")
+    Sleep(200)
     
-    if (!code) {
-        ConsoleLog("✗ No code entered")
-        return
+    if IsRobloxOpen() {
+        Log("[SYS] ROBLOX PROCESS: DETECTED")
+    } else {
+        Log("[SYS] ROBLOX PROCESS: NOT FOUND")
+        Log("[SYS] Launch Roblox before injecting")
     }
     
-    if (!robloxPID) {
-        ConsoleLog("✗ Not attached to Roblox")
-        return
-    }
-    
-    ConsoleLog("═══════════════════════════════════")
-    result := InjectLua(code)
-    
-    if (!result.success) {
-        ConsoleLog("✗ " . result.error)
-    }
+    Sleep(100)
+    Log("[SYS] ══════════════════════════")
+    Log("[SYS] READY")
+    Log("[SYS] ══════════════════════════")
 }
 
-OnDetach(GuiObj, Info) {
-    DetachRoblox()
-}
+; ===== START =====
 
-OnClear(GuiObj, Info) {
-    consoleOutput := []
-    MyGui["_ConsoleOutput"].Value := ""
-    ConsoleLog("Console cleared")
-}
-
-ConsoleLog("═══════════════════════════════════")
-ConsoleLog("ROBLOX LUA INJECTOR - READY")
-ConsoleLog("Click ATTACH ROBLOX to start")
-ConsoleLog("═══════════════════════════════════")
+BuildGUI()
+AutoSetup()
+BootSequence()
+StartCRTEffect()
 
 return
